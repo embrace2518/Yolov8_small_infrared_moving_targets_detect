@@ -1,0 +1,14 @@
+# Custom dataset for infrared moving targets detection (preprocessed)
+# NOTE: use forward slashes on Windows to avoid YAML escape issues.
+path: "D:/Dataset_preprocessed"  # dataset root dir
+train: ["train/enhanced/1", "train/enhanced/10"]
+val: "train/enhanced/11"
+test: "test/enhanced/11"
+
+# Labels should be generated under:
+# D:/Dataset_preprocessed/train/labels/<sequence>/<frame>.txt
+# D:/Dataset_preprocessed/test/labels/<sequence>/<frame>.txt (optional for evaluation)
+
+# Classes
+names:
+  0: target
