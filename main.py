@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from ultralytics import YOLO
-from dataset.convert_json import model_validate
+from dataset.dataset import model_validate
 
 
 def parse_args() -> argparse.Namespace:

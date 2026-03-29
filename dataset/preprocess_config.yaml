@@ -1,7 +1,5 @@
 io:
-  input_root: D:/Dataset/train/2
-  output_root: D:/Dataset_preprocessed/train
-  image_exts: [.png, .jpg, .jpeg, .bmp, .tif, .tiff]
+  image_exts: [.png, .jpg]
 
 nuc:
   alpha: 0.02

@@ -18,8 +18,6 @@ def load_training_config(config_path: str, args: argparse.Namespace) -> Training
         config_dict = yaml.safe_load(f) or {}
     if args.epochs is not None:
         config_dict["epochs"] = args.epochs
-    if args.resume is not None:
-        config_dict["resume"] = args.resume
     if args.device is not None:
         config_dict["device"] = args.device
     return TrainingConfig(**config_dict)

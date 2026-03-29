@@ -41,7 +41,6 @@ python dataset\preprocess.py --config dataset\preprocess_config.yaml --input D:\
 
 ```powershell
 python train.py --config train_config.yaml
-python train.py --config train_config.yaml --epochs 50 --batch-size 4
 python train.py --config train_config.yaml --device cpu
 python train.py --config train_config.yaml --resume runs\detect\exp_xxx\weights\last.pt
 ```

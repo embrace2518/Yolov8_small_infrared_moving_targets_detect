@@ -1,17 +1,15 @@
 # Training config used by train.py -> trainer.TrainingConfig
 
-# Dataset root must follow YOLO layout:
-# <root>/images/*.jpg|png
-# <root>/labels/*.txt
-train_data_dir: "D:/Dataset_preprocessed/train"
-val_data_dir: "D:/Dataset_preprocessed/val"
+# Dataset
+train_data_dir: ["D:/Dataset/train/1", "D:/Dataset/train/2", "D:/Dataset/train/3", "D:/Dataset/train/4"]
+val_data_dir: "D:/Dataset/train/5"
 output_dir: "runs/detect"
 preprocess_config_path: "dataset/preprocess_config.yaml"
 
 # Model
 base_model: "models/yolov8.yaml"
 pretrained: true
-pretrained_weights: "models/yolov8.pt"
+pretrained_weights: "models/yolov8_last.pt"
 num_classes: 1
 class_names: ["target"]
 
