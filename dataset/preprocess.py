@@ -1,4 +1,4 @@
-import argparse
+from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import yaml
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+IMAGE_EXTS = {".png", ".jpg"}
 
 
 @dataclass
@@ -80,10 +80,6 @@ def load_config(config_path: Path) -> PipelineConfig:
     )
 
 
-def list_sequence_dirs(input_root: Path) -> list[Path]:
-    return sorted([p for p in input_root.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
-
-
 def list_frames(sequence_dir: Path, image_exts: tuple[str, ...]) -> list[Path]:
     frames = [p for p in sequence_dir.iterdir() if p.is_file() and p.suffix.lower() in image_exts]
     return sorted(frames, key=natural_key)
@@ -129,9 +125,7 @@ def process_sequence(sequence_dir: Path, config: PipelineConfig) -> int:
 
     seq_name = sequence_dir.name
     enhanced_dir = config.output_root / "enhanced" / seq_name
-
     enhanced_dir.mkdir(parents=True, exist_ok=True)
-
     nuc = SceneBasedNUC(alpha=config.nuc_alpha)
     for frame_path in frames:
         gray = read_gray_image(frame_path)
@@ -143,71 +137,51 @@ def process_sequence(sequence_dir: Path, config: PipelineConfig) -> int:
             tile_grid_size=config.clahe_tile_grid_size,
             gamma=config.gamma,
         )
-
         enhanced_path = enhanced_dir / frame_path.name
         cv2.imwrite(str(enhanced_path), enhanced)
 
+    print(f"[sequence] {sequence_dir.name}: frames={len(frames)}")
     return len(frames)
 
 
 def run_pipeline(config: PipelineConfig) -> None:
-    sequence_dirs = list_sequence_dirs(config.input_root)
-    if not sequence_dirs:
-        raise FileNotFoundError(f"No sequence folders found under: {config.input_root}")
+    input_root = Path(config.input_root)
+    if not input_root.exists():
+        raise FileNotFoundError(f"No sequence folders found under: {input_root}")
 
+    config.output_root.mkdir(parents=True, exist_ok=True)
     total_frames = 0
-    for sequence_dir in sequence_dirs:
-        frame_count = process_sequence(sequence_dir, config)
-        total_frames += frame_count
-        print(f"[sequence] {sequence_dir.name}: frames={frame_count}")
+    direct_count = process_sequence(input_root, config)
+    if direct_count > 0:
+        total_frames += direct_count
+    else:
+        for sequence_dir in input_root.iterdir():
+            if sequence_dir.is_dir():
+                frame_count = process_sequence(sequence_dir, config)
+                total_frames += frame_count
 
-    print(f"Done. sequences={len(sequence_dirs)}, frames={total_frames}")
+    print(f"Total frames processed: {total_frames}")
     print(f"Output root: {config.output_root}")
 
 
-def build_self_test_dataset(root: Path) -> Path:
-    seq_dir = root / "demo_seq"
-    seq_dir.mkdir(parents=True, exist_ok=True)
-    h, w = 128, 160
-    rng = np.random.default_rng(7)
-
-    for idx in range(12):
-        base = np.tile(np.linspace(45, 80, w, dtype=np.float32), (h, 1))
-        fpn = rng.normal(0, 5, size=(h, w)).astype(np.float32)
-        frame = base + fpn
-        target_x = 20 + idx * 8
-        target_y = 40 + idx * 3
-        cv2.circle(frame, (target_x, target_y), 2, 220, -1)
-        frame = np.clip(frame, 0, 255).astype(np.uint8)
-        cv2.imwrite(str(seq_dir / f"{idx:03d}.png"), frame)
-    return root
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Infrared preprocessing pipeline: NUC, denoise, CLAHE, and enhancement image export.")
-    parser.add_argument("--config", default=str(Path(__file__).with_name("preprocess_config.yaml")), help="Path to YAML config file.")
-    parser.add_argument("--input", help="Optional override for input_root.")
-    parser.add_argument("--output", help="Optional override for output_root.")
-    parser.add_argument("--self-test", action="store_true", help="Generate a tiny synthetic sequence and run the pipeline on it.")
+def parse_args() -> Namespace:
+    parser = ArgumentParser(description="Infrared preprocess pipeline")
+    parser.add_argument("--config", type=str, default="dataset/preprocess_config.yaml", help="配置文件路径")
+    parser.add_argument("--input", type=str, default=None, help="覆盖 input_root")
+    parser.add_argument("--output", type=str, default=None, help="覆盖 output_root")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    config = load_config(Path(args.config).resolve())
+    cfg = load_config(Path(args.config))
 
-    if args.self_test:
-        temp_root = Path(__file__).resolve().parents[1] / "runs" / "preprocess_self_test"
-        input_root = build_self_test_dataset(temp_root / "input")
-        config.input_root = input_root
-        config.output_root = temp_root / "output"
-    else:
-        if args.input:
-            config.input_root = Path(args.input).resolve()
-        if args.output:
-            config.output_root = Path(args.output).resolve()
+    if args.input:
+        cfg.input_root = Path(args.input).resolve()
+    if args.output:
+        cfg.output_root = Path(args.output).resolve()
 
-    run_pipeline(config)
+    run_pipeline(cfg)
 
 
 if __name__ == "__main__":

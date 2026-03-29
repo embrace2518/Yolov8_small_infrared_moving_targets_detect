@@ -1,7 +1,7 @@
 # Custom dataset for infrared moving targets detection (preprocessed)
 # NOTE: use forward slashes on Windows to avoid YAML escape issues.
 path: "D:/Dataset_preprocessed"  # dataset root dir
-train: ["train/enhanced/1", "train/enhanced/10"]
+train: ["train/enhanced/1", "train/enhanced/2", "train/enhanced/3", "train/enhanced/4", "train/enhanced/5"]
 val: "train/enhanced/11"
 test: "test/enhanced/11"
 

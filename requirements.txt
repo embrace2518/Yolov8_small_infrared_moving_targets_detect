@@ -1,4 +1,5 @@
 ultralytics
+torch
 numpy
 opencv-python
 PyYAML

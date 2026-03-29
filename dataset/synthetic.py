@@ -481,19 +481,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-id", type=int, default=0, help="Class ID written into YOLO labels.")
     parser.add_argument("--score-thresh", type=float, default=5.0, help="Minimum proposal score to keep.")
     parser.add_argument("--max-objects", type=int, default=20, help="Maximum boxes written per frame; <=0 keeps all.")
-    parser.add_argument("--self-test", action="store_true", help="Generate a tiny synthetic enhanced set and run this pipeline.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     config = load_config(Path(args.config).resolve())
-
-    if args.self_test:
-        temp_root = Path(__file__).resolve().parents[1] / "runs" / "proposal_label_self_test"
-        enhanced_root = build_self_test_dataset(temp_root / "enhanced")
-        config.enhanced_root = enhanced_root
-        config.output_root = temp_root
 
     if args.input:
         config.enhanced_root = Path(args.input).resolve()

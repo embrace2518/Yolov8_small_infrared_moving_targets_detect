@@ -1,59 +1,57 @@
+# Yolov8 Small Infrared Moving Targets Detect
 
+## 1) 数据准备
 
+训练/验证目录使用 YOLO 标准结构：
+
+```text
+<root>/
+  images/
+  labels/
 ```
-python my_anno.json
-python validation.py my_anno.json true_labels.json
+
+其中 `labels/*.txt` 为 YOLO 格式：
+
+```text
+class_id x_center y_center width height
 ```
 
-## 红外数据预处理
+坐标都归一化到 `[0,1]`。
 
-新增文件：`dataset/preprocess_ir.py`
+## 2) 预处理（可选）
+
+脚本：`dataset/preprocess.py`
 
 处理流程：
-- 非均匀校正（场景自适应 NUC）
-- 噪声抑制（Gaussian / Median / NLM）
-- 动态范围压缩与对比度增强（CLAHE + Gamma）
-- 背景抑制（GMM / MOG2）
-- 目标初筛（连通域候选框）
+- NUC（非均匀校正）
+- 去噪（Gaussian / Median / NLM）
+- CLAHE + Gamma 增强
 
-默认配置文件：`dataset/preprocess_config.yaml`
-
-### 自检运行
+运行示例：
 
 ```powershell
-python dataset\preprocess_ir.py --self-test
+python dataset\preprocess.py --config dataset\preprocess_config.yaml --input D:\Dataset\train --output D:\Dataset_preprocessed\train
 ```
 
-### 处理真实数据
+## 3) 训练
+
+入口：`train.py`
+
+说明：训练前会用 `EnhancedYOLODataset + DataLoader` 做预处理并暂存到 `runs/detect/staging/...`，然后调用 Ultralytics `YOLO.train()` 训练。
 
 ```powershell
-python dataset\preprocess_ir.py --config dataset\preprocess_config.yaml --input D:\Dataset\train --output D:\Dataset_preprocessed\train
+python train.py --config train_config.yaml
+python train.py --config train_config.yaml --epochs 50 --batch-size 4
+python train.py --config train_config.yaml --device cpu
+python train.py --config train_config.yaml --resume runs\detect\exp_xxx\weights\last.pt
 ```
 
-输出目录结构：
-- `enhanced/序列号/`：增强后的训练图像
+## 4) 推理
 
-## proposals/labels 生成（统一脚本）
-
-使用文件：`dataset/synthetic_augment.py`
-
-作用：从 `enhanced/<序列>/<帧>` 生成 `masks/overlays/proposals`，并可选直接转换为 YOLO 标签 `labels/<序列>/<帧>.txt`。
-
-### 自检运行
+入口：`main.py`
 
 ```powershell
-python dataset\synthetic_augment.py --self-test --convert-labels
+python main.py --model models\yolov8.pt --source D:\Dataset\test\1 --save --conf 0.1
 ```
 
-### 训练集：生成 proposals 并转换 labels（推荐）
-
-```powershell
-python dataset\synthetic_augment.py --config dataset\preprocess_config.yaml --input D:\Dataset_preprocessed\train\enhanced --output D:\Dataset_preprocessed\train --convert-labels --score-thresh 5.0 --class-id 0 --max-objects 20
-```
-
-### 仅将已有 proposals 转为 labels（可选）
-
-```powershell
-python dataset\synthetic_augment.py --input D:\Dataset_preprocessed\train\enhanced --output D:\Dataset_preprocessed\train --convert-labels --proposal-root D:\Dataset_preprocessed\train\proposals --label-root D:\Dataset_preprocessed\train\labels --score-thresh 5.0 --class-id 0 --max-objects 20
-```
-
+预测图默认保存在 `runs/detect/predict*`。

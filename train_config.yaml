@@ -1,0 +1,46 @@
+# Training config used by train.py -> trainer.TrainingConfig
+
+# Dataset root must follow YOLO layout:
+# <root>/images/*.jpg|png
+# <root>/labels/*.txt
+train_data_dir: "D:/Dataset_preprocessed/train"
+val_data_dir: "D:/Dataset_preprocessed/val"
+output_dir: "runs/detect"
+preprocess_config_path: "dataset/preprocess_config.yaml"
+
+# Model
+base_model: "models/yolov8.yaml"
+pretrained: true
+pretrained_weights: "models/yolov8.pt"
+num_classes: 1
+class_names: ["target"]
+
+# Train
+epochs: 10
+batch_size: 16
+imgsz: 640
+device: "cuda"
+workers: 0
+optimizer: "AdamW"
+learning_rate: 0.001
+weight_decay: 0.0005
+warmup_epochs: 2.0
+use_amp: true
+half: false
+multi_scale: false
+cache: True
+
+# Augment
+augment: true
+mosaic: 0.0
+mixup: 0.0
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+
+# Control
+seed: 42
+patience: 30
+save_period: 10
+run_name: null
+refresh_staging: true
