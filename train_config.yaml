@@ -1,8 +1,9 @@
 # Training config used by train.py -> trainer.TrainingConfig
 
 # Dataset
-train_data_dir: ["D:/Dataset/train/1", "D:/Dataset/train/2", "D:/Dataset/train/3", "D:/Dataset/train/4"]
-val_data_dir: "D:/Dataset/train/5"
+train_data_dir: ["D:/Dataset/train/1", "D:/Dataset/train/2", "D:/Dataset/train/3", "D:/Dataset/train/4", "D:/Dataset/train/5",
+                 "D:/Dataset/train/6", "D:/Dataset/train/7", "D:/Dataset/train/8", "D:/Dataset/train/9"," D:/Dataset/train/10"]
+val_data_dir: "D:/Dataset/train/11"
 output_dir: "runs/detect"
 preprocess_config_path: "dataset/preprocess_config.yaml"
 
@@ -15,7 +16,7 @@ class_names: ["target"]
 
 # Train
 epochs: 10
-batch_size: 16
+batch_size: 8
 imgsz: 640
 device: "cuda"
 workers: 0

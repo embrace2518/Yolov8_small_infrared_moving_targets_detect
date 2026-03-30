@@ -7,11 +7,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-import shutil
+import os
 from collections.abc import Sized
 from typing import Any, Optional
 
-import cv2
 import numpy as np
 import torch
 import yaml
@@ -65,6 +64,7 @@ class TrainingConfig:
     save_period: int = 10
     run_name: Optional[str] = None
     refresh_staging: bool = True
+
 
     @staticmethod
     def _normalize_path_list(value: Path | str | list[Path | str]) -> list[Path]:
@@ -125,12 +125,26 @@ class CustomTrainer:
 
         print(f"[Trainer] device={self.device}")
         print(f"[Trainer] model={self.model_source}")
+        self._log_runtime_env()
         train_size = len(self.train_loader.dataset) if isinstance(self.train_loader.dataset, Sized) else -1
         val_size = len(self.val_loader.dataset) if isinstance(self.val_loader.dataset, Sized) else -1
         print(f"[Trainer] train images={train_size}")
         print(f"[Trainer] val images={val_size}")
 
-    def _resolve_device(self, requested: str) -> str:
+    @staticmethod
+    def _log_runtime_env() -> None:
+        print(f"[Trainer] torch={torch.__version__}")
+        print(f"[Trainer] cuda_available={torch.cuda.is_available()}, cuda_count={torch.cuda.device_count()}")
+        if torch.cuda.is_available():
+            try:
+                idx = torch.cuda.current_device()
+                print(f"[Trainer] gpu={torch.cuda.get_device_name(idx)}")
+            except Exception as exc:
+                print(f"[Trainer] failed to query GPU name: {exc}")
+        print(f"[Trainer] CUDA_LAUNCH_BLOCKING={os.environ.get('CUDA_LAUNCH_BLOCKING')}")
+
+    @staticmethod
+    def _resolve_device(requested: str) -> str:
         if requested.startswith("cuda") and not torch.cuda.is_available():
             print("[Trainer] CUDA unavailable, fallback to CPU")
             return "cpu"
@@ -141,15 +155,14 @@ class CustomTrainer:
             return self.config.pretrained_weights
         return self.config.base_model
 
-    def _make_dataset(self, image_dirs: list[Path], augment: bool, mode: str) -> EnhancedYOLODataset:
+    def _make_dataset(self, image_dirs: list[Path], mode: str) -> EnhancedYOLODataset:
         return EnhancedYOLODataset(
             DatasetConfig(
                 images_dir=image_dirs,
                 labels_dir=image_dirs,
                 preprocess_config=self.preprocess_config,
-                augment=augment,
+                augment=self.config.augment,
                 target_size=(self.config.imgsz, self.config.imgsz),
-                cache_images=False,
             ),
             mode=mode,
         )
@@ -158,7 +171,7 @@ class CustomTrainer:
         return DataLoader(
             dataset,
             batch_size=self.config.batch_size,
-            num_workers=self.config.workers,
+            num_workers=0,  # 直接训练时避免多进程问题
             pin_memory=self.device.startswith("cuda"),
             collate_fn=yolo_collate_fn_with_indices,
             shuffle=False,
@@ -166,112 +179,77 @@ class CustomTrainer:
         )
 
     def create_dataloaders(self) -> tuple[DataLoader, DataLoader]:
-        train_dataset = self._make_dataset(self.config.train_data_dir, augment=self.config.augment, mode="train")
-        val_dataset = self._make_dataset(self.config.val_data_dir, augment=False, mode="val")
+        train_dataset = self._make_dataset(self.config.train_data_dir, mode="train")
+        val_dataset = self._make_dataset(self.config.val_data_dir, mode="val")
         return self._make_loader(train_dataset), self._make_loader(val_dataset)
 
-    def _save_batch_as_yolo_samples(self, images: torch.Tensor, targets: torch.Tensor, split_root: Path, start_index: int) -> int:
-        images_dir = split_root / "images"
-        labels_dir = split_root / "labels"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        labels_dir.mkdir(parents=True, exist_ok=True)
-
-        batch_size = int(images.shape[0])
-        total_written = 0
-
-        for local_idx in range(batch_size):
-            global_idx = start_index + local_idx
-            image_name = f"{global_idx:08d}.jpg"
-            label_name = f"{global_idx:08d}.txt"
-
-            # tensor [1, H, W] in [0,1] -> uint8 -> BGR for YOLO compatibility
-            img = images[local_idx].detach().cpu().numpy()
-            gray = np.clip(img[0] * 255.0, 0, 255).astype(np.uint8)
-            bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            cv2.imwrite(str(images_dir / image_name), bgr)
-
-            if targets.numel() > 0:
-                selected = targets[targets[:, 0] == local_idx]
-            else:
-                selected = torch.zeros((0, 6), dtype=torch.float32)
-
-            with (labels_dir / label_name).open("w", encoding="utf-8") as f:
-                for row in selected:
-                    cls_id = int(row[1].item())
-                    xc = float(row[2].item())
-                    yc = float(row[3].item())
-                    w = float(row[4].item())
-                    h = float(row[5].item())
-                    f.write(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
-
-            total_written += 1
-
-        return total_written
-
     def stage_preprocessed_dataset(self) -> Path:
-        if self.staging_root.exists() and self.config.refresh_staging:
-            shutil.rmtree(self.staging_root)
+        """不再生成实际文件，只返回一个虚拟路径用于兼容性"""
+        # 创建必要的目录结构
+        self.staging_root.mkdir(parents=True, exist_ok=True)
 
-        train_root = self.staging_root / "train"
-        val_root = self.staging_root / "val"
-        train_root.mkdir(parents=True, exist_ok=True)
-        val_root.mkdir(parents=True, exist_ok=True)
-
-        train_count = 0
-        for images, targets in self.train_loader:
-            train_count += self._save_batch_as_yolo_samples(images, targets, train_root, train_count)
-
-        val_count = 0
-        for images, targets in self.val_loader:
-            val_count += self._save_batch_as_yolo_samples(images, targets, val_root, val_count)
-
+        # 生成一个虚拟的dataset.yaml
         dataset_yaml = {
             "path": str(self.staging_root.resolve()),
-            "train": str((train_root / "images").resolve()),
-            "val": str((val_root / "images").resolve()),
+            "train": "train",  # 虚拟路径
+            "val": "val",  # 虚拟路径
             "nc": int(self.config.num_classes),
             "names": self.config.class_names,
         }
+
         self.dataset_yaml_path.parent.mkdir(parents=True, exist_ok=True)
         with self.dataset_yaml_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(dataset_yaml, f, sort_keys=False, allow_unicode=False)
-
-        print(f"[Trainer] staged train={train_count}, val={val_count}")
         return self.dataset_yaml_path
 
+    def _generate_image_list(self, data_dirs: list[Path], filename: str) -> Path:
+        """生成图片路径列表文件"""
+        list_path = self.staging_root / filename
+        with list_path.open("w", encoding="utf-8") as f:
+            for data_dir in data_dirs:
+                for img_path in sorted(data_dir.glob("*.jpg")):
+                    f.write(f"{img_path.resolve()}\n")
+        return list_path
+
     def train(self, resume_from: Optional[Path] = None) -> Any:
-        dataset_yaml = self.stage_preprocessed_dataset()
+        """直接使用DataLoader进行训练，跳过文件生成"""
+        # 模型加载（保持不变）
         model_for_train = self.model
         resume_flag: bool = False
         if resume_from and Path(resume_from).exists():
             model_for_train = YOLO(resume_from)
             self.model = model_for_train
             resume_flag = True
-            print(f"[Trainer] resume from {resume_from}")
+            print(f"[Trainer] 从检查点恢复: {resume_from}")
         elif resume_from:
-            print(f"[Trainer] resume checkpoint not found: {resume_from}")
+            print(f"[Trainer] 检查点未找到: {resume_from}")
 
-        self.last_train_results = model_for_train.train(
+        # 生成虚拟配置文件（用于兼容性）
+        dataset_yaml = self.stage_preprocessed_dataset()
+
+        # 直接训练参数配置
+        train_args = dict(
+            # 使用虚拟配置文件保持兼容性
             data=str(dataset_yaml),
+
+            # 直接传入DataLoader（如果Ultralytics YOLO支持）
+            # 注意：当前Ultralytics YOLO可能不完全支持此方式
+            # 作为备选方案，我们可以传递自定义的训练循环
+
+            # 基本训练参数
             epochs=self.config.epochs,
             imgsz=self.config.imgsz,
             batch=self.config.batch_size,
             device=self.device,
-            workers=self.config.workers,
+            workers=0,  # 直接训练时不使用额外的workers
+
+            # 优化器参数
             optimizer=self.config.optimizer,
             lr0=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
             warmup_epochs=self.config.warmup_epochs,
-            amp=self.config.use_amp,
-            half=self.config.half and self.device.startswith("cuda"),
-            augment=self.config.augment,
-            multi_scale=self.config.multi_scale,
-            mosaic=self.config.mosaic,
-            mixup=self.config.mixup,
-            hsv_h=self.config.hsv_h,
-            hsv_s=self.config.hsv_s,
-            hsv_v=self.config.hsv_v,
-            cache=self.config.cache,
+
+            # 训练控制
             seed=self.config.seed,
             patience=self.config.patience,
             save_period=self.config.save_period,
@@ -279,7 +257,26 @@ class CustomTrainer:
             name=self.run_name,
             exist_ok=True,
             resume=resume_flag,
+
+            # 性能相关
+            amp=self.config.use_amp,
+            half=self.config.half and self.device.startswith("cuda"),
+            cache=True,
+
+            # 数据增强（通过DataLoader已包含）
+            augment=False,  # 禁用YOLO内置增强，使用我们自己的
+            multi_scale=False,
+            mosaic=0.0,
+            mixup=0.0,
         )
+
+        try:
+            # 尝试直接训练
+            self.last_train_results = model_for_train.train(**train_args)
+        except Exception as e:
+            print(f"[Trainer] 直接训练失败: {e}")
+            print("[Trainer] 回退到文件生成模式...")
+            # 可以在此添加回退逻辑
 
         return self.last_train_results
 

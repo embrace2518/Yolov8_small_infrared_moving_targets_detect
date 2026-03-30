@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import argparse
 import json
+import logging
 import random
 import re
 import threading
 from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Any, Optional
+from typing import Any
 
 import cv2
 import numpy as np
@@ -23,15 +24,9 @@ class DatasetConfig:
     images_dir: Path | str | list[Path | str]
     labels_dir: Path | str | list[Path | str]
     preprocess_config: PipelineConfig
+    augment: bool
+    target_size: tuple[int, int]
 
-    augment: bool = True
-    flip_prob: float = 0.5
-    rotate_prob: float = 0.3
-    rotate_degrees: int = 10
-    brightness_jitter: float = 0.2
-    contrast_jitter: float = 0.2
-
-    target_size: tuple[int, int] = (640, 640)
     cache_images: bool = True
     cache_labels: bool = True
     prefetch: bool = True
@@ -41,17 +36,26 @@ class DatasetConfig:
     prefetch_workers: int = 2
     prefetch_size: int = 128
 
+    flip_prob: float = 0.5
+    rotate_prob: float = 0.3
+    rotate_degrees: int = 10
+    brightness_jitter: float = 0.2
+    contrast_jitter: float = 0.2
+
+    true_labels_json_path: Path | str | None = None
+    json_label_class_id: int = 0
+    json_fallback_box_width: int = 16
+    json_fallback_box_height: int = 16
+
 @dataclass
 class SequenceData:
     """单个序列的数据"""
-    __slots__ = ('name', 'frame_paths', 'label_paths', 'image_cache',
-                 'label_cache', 'nuc', 'lock', 'last_processed_frame')
     name: str
     frame_paths: list[Path]
     label_paths: list[Path]
     image_cache: OrderedDict[int, np.ndarray] = field(default_factory=OrderedDict)
     label_cache: OrderedDict[int, np.ndarray] = field(default_factory=OrderedDict)
-    nuc: Optional[SceneBasedNUC] = None
+    nuc: SceneBasedNUC | None = None
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     last_processed_frame: int = -1
 
@@ -59,7 +63,7 @@ class SequenceData:
         return len(self.frame_paths)
 
 class EnhancedYOLODataset(Dataset):
-    def __init__(self, config: DatasetConfig, mode: str = "train"):
+    def __init__(self, config: DatasetConfig, mode: str):
         self.config = config
         self.mode = mode
         self.do_augment = mode == "train" and config.augment
@@ -67,6 +71,16 @@ class EnhancedYOLODataset(Dataset):
         self.image_dirs = self._normalize_dirs(config.images_dir)
         self.label_dirs = self._normalize_dirs(config.labels_dir)
         self.target_size = config.target_size
+
+        self.flip_prob = config.flip_prob
+        self.rotate_prob = config.rotate_prob
+        self.rotate_degrees = config.rotate_degrees
+        self.brightness_jitter = config.brightness_jitter
+        self.contrast_jitter = config.contrast_jitter
+
+        self.prefetch_enabled = config.prefetch
+
+        self.logger = logging.getLogger(__name__)
 
         self.sequences = self._load_sequences()
         if not self.sequences:
@@ -76,9 +90,9 @@ class EnhancedYOLODataset(Dataset):
         self._validate_annotations()
         self._init_preprocessors()
 
-        self._cache_lock = threading.Lock()
-        self._global_image_lru: OrderedDict[tuple[int, int], None] = OrderedDict()
-        self._global_label_lru: OrderedDict[tuple[int, int], None] = OrderedDict()
+        self._label_json_index: dict[tuple[str | int, str | int], dict] = {}
+        if config.true_labels_json_path and Path(config.true_labels_json_path).exists():
+            self._load_and_index_true_labels_json(self, config.true_labels_json_path)
 
         self._prefetch_cache_lock = threading.Lock()
         self._prefetch_cache: OrderedDict[int, tuple[np.ndarray, np.ndarray]] = OrderedDict()
@@ -90,7 +104,20 @@ class EnhancedYOLODataset(Dataset):
         if self.config.prefetch:
             self._start_prefetch_threads()
 
-        print(f"初始化 {mode} 数据集: {len(self.samples)} 张图片")
+    @staticmethod
+    def _load_and_index_true_labels_json(self, json_path: Path | str) -> None:
+        with Path(json_path).open('r', encoding='utf-8') as f:
+            data = json.load(f)
+        index = {}
+        for item in data:
+            seq_id_raw = item.get("sequence_id")
+            frame_raw = item.get("frame")
+            if seq_id_raw is None or frame_raw is None:
+                continue
+            seq_id = _to_int_or_self(str(seq_id_raw))
+            frame = _to_int_or_self(str(frame_raw))
+            index[(seq_id, frame)] = item
+        self._label_json_index = index
 
     @staticmethod
     def _normalize_dirs(path_like: Path | str | list[Path | str]) -> list[Path]:
@@ -99,10 +126,11 @@ class EnhancedYOLODataset(Dataset):
         return [Path(p) for p in path_like]
 
     @staticmethod
-    def _image_sort_key(path: Path) -> tuple[str, int | str]:
-        match = re.search(r"(\d+)$", path.stem)
-        frame_key: int | str = int(match.group(1)) if match else path.stem
-        return str(path.parent), frame_key
+    def _image_sort_key(path: Path) -> tuple[str, int, str]:
+        stem = path.stem
+        numbers = list(map(int, re.findall(r'\d+', stem)))
+        primary_num = numbers[-1] if numbers else -1
+        return str(path.parent), primary_num, stem
 
     def _load_image_files(self) -> list[Path]:
         image_exts = self.config.preprocess_config.image_exts
@@ -122,27 +150,17 @@ class EnhancedYOLODataset(Dataset):
         for parent_str, frame_paths in grouped.items():
             ordered_frames = sorted(frame_paths, key=self._image_sort_key)
             label_paths = [self._resolve_label_path(p) for p in ordered_frames]
-            sequences.append(
-                SequenceData(
-                    name=Path(parent_str).name,
-                    frame_paths=ordered_frames,
-                    label_paths=label_paths,
-                )
-            )
-
+            sequences.append(SequenceData(name=Path(parent_str).name, frame_paths=ordered_frames, label_paths=label_paths,))
         sequences.sort(key=lambda s: s.name)
         return sequences
 
     def _relative_to_image_root(self, image_path: Path) -> Path:
         for root in self.image_dirs:
-            try:
+            with suppress(ValueError):
                 return image_path.relative_to(root)
-            except ValueError:
-                continue
         return Path(image_path.name)
 
     def _resolve_label_path(self, image_path: Path) -> Path:
-        # 优先同目录同名标签，适配“图片和标签混放”。
         same_dir_label = image_path.with_suffix(".txt")
         if same_dir_label.exists():
             return same_dir_label
@@ -160,26 +178,60 @@ class EnhancedYOLODataset(Dataset):
             if candidate.exists():
                 return candidate
 
+        # ========== 新增第4步：从JSON索引按需生成 ==========
+        # 如果以上都找不到，且我们有关联的JSON索引，则尝试从JSON生成
+        if self._label_json_index:
+            parent_name = image_path.parent.name
+            stem_name = image_path.stem
+            seq_match = re.search(r"(\d+)", parent_name)
+            frame_match = re.search(r"(\d+)", stem_name)
+            sequence_id = _to_int_or_self(seq_match.group(1)) if seq_match else parent_name
+            frame = _to_int_or_self(frame_match.group(1)) if frame_match else stem_name
+            lookup_key = (sequence_id, frame)
+            json_item = self._label_json_index.get(lookup_key)
+            if json_item is not None:
+                target_label_path = same_dir_label
+                target_label_path.parent.mkdir(parents=True, exist_ok=True)
+
+                success = _generate_single_label_from_json(
+                    self,
+                    json_item=json_item,
+                    target_label_path=target_label_path,
+                    image_width = self.config.target_size[0],
+                    image_height=self.config.target_size[1],
+                    class_id=self.config.json_label_class_id,
+                    fallback_box_width=self.config.json_fallback_box_width,
+                    fallback_box_height=self.config.json_fallback_box_height,
+                )
+                if success:
+                    return target_label_path
+            # ===================================================
+        # 4. 所有尝试都失败，返回一个（可能不存在的）占位路径
+        # （注意：原代码的“3. 兼容旧目录”步骤现在变成了第3步，这是第4步）
         return same_dir_label
 
     def _build_sample_index(self) -> list[tuple[int, int]]:
-        sample_index: list[tuple[int, int]] = []
-        for seq_idx, seq in enumerate(self.sequences):
-            for frame_idx in range(len(seq.frame_paths)):
-                sample_index.append((seq_idx, frame_idx))
-        return sample_index
+        """构建数据集索引列表，每个元素为 (序列索引, 帧索引)。"""
+        return [
+            (seq_idx, frame_idx)
+            for seq_idx, seq in enumerate(self.sequences)
+            for frame_idx in range(len(seq))  # 使用 seq.__len__() 接口
+        ]
 
     def _validate_annotations(self) -> None:
-        missing_labels = []
-        for seq in self.sequences:
-            for img_path, label_path in zip(seq.frame_paths, seq.label_paths):
-                if not label_path.exists():
-                    missing_labels.append(img_path.name)
-
+        """验证所有图片是否都有对应的标签文件，并报告缺失项。"""
+        missing_labels = [
+            img_path.name
+            for seq in self.sequences
+            for img_path, label_path in zip(seq.frame_paths, seq.label_paths)
+            if not label_path.exists()
+        ]
         if missing_labels:
-            print(f"warning: 缺少 {len(missing_labels)} 个标注文件")
-            for name in missing_labels[:5]:
-                print(f"  - {name}")
+            self.logger.warning("发现 %d 个图片缺失对应的标签文件。", len(missing_labels))
+            for name, full_path in missing_labels[:5]:
+                self.logger.warning("缺失标签: 文件 %s (路径: %s)", name, full_path)
+            if len(missing_labels) > 5:
+                self.logger.warning("... 以及另外 %d 个文件。", len(missing_labels) - 5)
 
     def _init_preprocessors(self) -> None:
         cfg = self.config.preprocess_config
@@ -228,17 +280,6 @@ class EnhancedYOLODataset(Dataset):
         with seq.lock:
             seq.image_cache[frame_idx] = image.copy()
 
-        key = (seq_idx, frame_idx)
-        with self._cache_lock:
-            self._global_image_lru[key] = None
-            self._global_image_lru.move_to_end(key)
-            while len(self._global_image_lru) > max(1, int(self.config.image_cache_size)):
-                old_key, _ = self._global_image_lru.popitem(last=False)
-                old_seq_idx, old_frame_idx = old_key
-                old_seq = self.sequences[old_seq_idx]
-                with old_seq.lock:
-                    old_seq.image_cache.pop(old_frame_idx, None)
-
     def _load_image(self, seq_idx: int, frame_idx: int) -> np.ndarray:
         seq = self.sequences[seq_idx]
         if self.config.cache_images:
@@ -271,17 +312,6 @@ class EnhancedYOLODataset(Dataset):
         seq = self.sequences[seq_idx]
         with seq.lock:
             seq.label_cache[frame_idx] = labels.copy()
-
-        key = (seq_idx, frame_idx)
-        with self._cache_lock:
-            self._global_label_lru[key] = None
-            self._global_label_lru.move_to_end(key)
-            while len(self._global_label_lru) > max(1, int(self.config.label_cache_size)):
-                old_key, _ = self._global_label_lru.popitem(last=False)
-                old_seq_idx, old_frame_idx = old_key
-                old_seq = self.sequences[old_seq_idx]
-                with old_seq.lock:
-                    old_seq.label_cache.pop(old_frame_idx, None)
 
     def _load_yolo_labels(self, seq_idx: int, frame_idx: int) -> np.ndarray:
         seq = self.sequences[seq_idx]
@@ -380,20 +410,20 @@ class EnhancedYOLODataset(Dataset):
         augmented_labels = labels.copy()
         h, w = image.shape[:2]
 
-        if random.random() < self.config.flip_prob:
+        if random.random() < self.flip_prob:
             augmented_image = cv2.flip(augmented_image, 1)
             if len(augmented_labels) > 0:
                 augmented_labels[:, 1] = 1.0 - augmented_labels[:, 1]
 
-        if random.random() < self.config.rotate_prob:
-            angle = random.uniform(-self.config.rotate_degrees, self.config.rotate_degrees)
+        if random.random() < self.rotate_prob:
+            angle = random.uniform(-self.rotate_degrees, self.rotate_degrees)
             center = (w // 2, h // 2)
             rot_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
             augmented_image = cv2.warpAffine(augmented_image, rot_matrix, (w, h), flags=cv2.INTER_LINEAR)
 
         if random.random() < 0.5:
-            alpha = 1.0 + random.uniform(-self.config.contrast_jitter, self.config.contrast_jitter)
-            beta = random.uniform(-255.0 * self.config.brightness_jitter, 255.0 * self.config.brightness_jitter)
+            alpha = 1.0 + random.uniform(-self.contrast_jitter, self.contrast_jitter)
+            beta = random.uniform(-255.0 * self.brightness_jitter, 255.0 * self.brightness_jitter)
             augmented_image = cv2.convertScaleAbs(augmented_image, alpha=alpha, beta=beta)
 
         return augmented_image, augmented_labels
@@ -445,7 +475,7 @@ class EnhancedYOLODataset(Dataset):
         return image
 
     def close(self) -> None:
-        if not self.config.prefetch:
+        if not self.prefetch:
             return
         self._stop_prefetch.set()
         for _ in self._prefetch_threads:
@@ -531,84 +561,65 @@ def _xyxy_to_xywh_norm(x1: float, y1: float, x2: float, y2: float, image_w: int,
     return xc / image_w, yc / image_h, bw / image_w, bh / image_h
 
 
-def convert_true_labels_to_yolo(
-    labels_json: str | Path,
-    output_root: str | Path,
-    image_width: int,
-    image_height: int,
-    class_id: int = 0,
-    fallback_to_fixed_box: bool = False,
-    fallback_box_width: int = 16,
-    fallback_box_height: int = 16,
-) -> int:
-    """将 true_labels.json 转换为 YOLO 标签。
+def _generate_single_label_from_json(self,
+                                     json_item: dict,
+                                     target_label_path: Path,
+                                     image_width: int,
+                                     image_height: int,
+                                     class_id: int = 0,
+                                     fallback_box_width: int = 16,
+                                     fallback_box_height: int = 16) -> bool:
+    """根据单个JSON条目生成YOLO标签文件。"""
+    object_bboxes = json_item.get("object_bboxes")
+    object_coords = json_item.get("object_coords", [])
 
-    B模式：优先使用 JSON 提供的 bbox（`object_bboxes`），支持两种格式：
-    - [x1, y1, x2, y2]
-    - [x_center, y_center, width, height]
-    """
-    labels_path = Path(labels_json)
-    output_root_path = Path(output_root)
-    output_root_path.mkdir(parents=True, exist_ok=True)
-
-    with labels_path.open("r", encoding="utf-8") as f:
-        labels = json.load(f)
-
-    written_files = 0
-    for item in labels:
-        sequence_id = item.get("sequence_id")
-        frame = item.get("frame")
-
-        if sequence_id is None or frame is None:
-            continue
-
-        object_bboxes = item.get("object_bboxes")
-        object_coords = item.get("object_coords", [])
-
-        seq_dir = output_root_path / str(sequence_id)
-        seq_dir.mkdir(parents=True, exist_ok=True)
-        label_file = seq_dir / f"{frame}.txt"
-
-        lines: list[str] = []
-        if isinstance(object_bboxes, list) and len(object_bboxes) > 0:
-            for box in object_bboxes:
-                if not isinstance(box, list) or len(box) != 4:
-                    continue
+    lines: list[str] = []
+    if isinstance(object_bboxes, list) and len(object_bboxes) > 0:
+        for box in object_bboxes:
+            if not isinstance(box, list) or len(box) != 4:
+                continue
+            try:
                 a, b, c, d = (float(v) for v in box)
+            except (ValueError, TypeError):
+                continue
 
-                # auto-detect format
-                if c > a and d > b:
-                    x_norm, y_norm, w_norm, h_norm = _xyxy_to_xywh_norm(a, b, c, d, image_width, image_height)
-                else:
-                    x_norm = a / image_width
-                    y_norm = b / image_height
-                    w_norm = c / image_width
-                    h_norm = d / image_height
+            if c > a and d > b:
+                x_norm, y_norm, w_norm, h_norm = _xyxy_to_xywh_norm(a, b, c, d, image_width, image_height)
+            else:
+                x_norm = a / image_width
+                y_norm = b / image_height
+                w_norm = c / image_width
+                h_norm = d / image_height
 
-                x_norm = float(np.clip(x_norm, 0.0, 1.0))
-                y_norm = float(np.clip(y_norm, 0.0, 1.0))
-                w_norm = float(np.clip(w_norm, 0.0, 1.0))
-                h_norm = float(np.clip(h_norm, 0.0, 1.0))
-                lines.append(f"{class_id} {x_norm:.6f} {y_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
-        elif fallback_to_fixed_box:
-            for coord in object_coords:
-                if not isinstance(coord, list) or len(coord) != 2:
-                    continue
+            x_norm = float(np.clip(x_norm, 0.0, 1.0))
+            y_norm = float(np.clip(y_norm, 0.0, 1.0))
+            w_norm = float(np.clip(w_norm, 0.0, 1.0))
+            h_norm = float(np.clip(h_norm, 0.0, 1.0))
+            lines.append(f"{class_id} {x_norm:.6f} {y_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
+    elif object_coords:  # 回退逻辑：使用object_coords和固定框
+        for coord in object_coords:
+            if not isinstance(coord, list) or len(coord) != 2:
+                continue
+            try:
                 x_center, y_center = float(coord[0]), float(coord[1])
-                x_norm = float(np.clip(x_center / image_width, 0.0, 1.0))
-                y_norm = float(np.clip(y_center / image_height, 0.0, 1.0))
-                w_norm = float(np.clip(fallback_box_width / image_width, 0.0, 1.0))
-                h_norm = float(np.clip(fallback_box_height / image_height, 0.0, 1.0))
-                lines.append(f"{class_id} {x_norm:.6f} {y_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
+            except (ValueError, TypeError):
+                continue
+            x_norm = float(np.clip(x_center / image_width, 0.0, 1.0))
+            y_norm = float(np.clip(y_center / image_height, 0.0, 1.0))
+            w_norm = float(np.clip(fallback_box_width / image_width, 0.0, 1.0))
+            h_norm = float(np.clip(fallback_box_height / image_height, 0.0, 1.0))
+            lines.append(f"{class_id} {x_norm:.6f} {y_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
 
-        with label_file.open("w", encoding="utf-8") as f:
+    try:
+        with target_label_path.open("w", encoding="utf-8") as f:
             if lines:
                 f.write("\n".join(lines) + "\n")
-
-        written_files += 1
-
-    print(f"converted yolo labels: {written_files} files -> {output_root_path}")
-    return written_files
+            # 注意：即使lines为空（即无目标），也创建一个空文件，以标记“此图片已处理，确实无目标”
+            # 这可以防止下次运行时再次查找JSON。
+        return True
+    except IOError as e:
+        print(f"[Dataset] 警告: 无法写入标签文件 {target_label_path}: {e}")
+        return False
 
 
 def run_validate_json(
@@ -633,59 +644,3 @@ def run_validate_json(
         exist_ok=True,
     )
     return model_validate(predictions, output_json=output_json)
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Dataset utility entry")
-    sub = parser.add_subparsers(dest="command")
-
-    p_convert = sub.add_parser("convert-labels", help="true_labels.json -> YOLO labels")
-    p_convert.add_argument("--labels-json", type=str, required=True)
-    p_convert.add_argument("--output-root", type=str, required=True)
-    p_convert.add_argument("--image-width", type=int, default=640)
-    p_convert.add_argument("--image-height", type=int, default=512)
-    p_convert.add_argument("--class-id", type=int, default=0)
-    p_convert.add_argument("--fallback-to-fixed-box", action="store_true", help="无 object_bboxes 时使用 object_coords 回退")
-    p_convert.add_argument("--fallback-box-width", type=int, default=16, help="回退固定框宽度（像素）")
-    p_convert.add_argument("--fallback-box-height", type=int, default=16, help="回退固定框高度（像素）")
-    p_validate = sub.add_parser("validate-json", help="run predict and export my_anno.json")
-    p_validate.add_argument("--model", type=str, required=True)
-    p_validate.add_argument("--source", type=str, required=True)
-    p_validate.add_argument("--output-json", type=str, default="my_anno.json")
-    p_validate.add_argument("--conf", type=float, default=0.1)
-    p_validate.add_argument("--save", action="store_true")
-    p_validate.add_argument("--project", type=str, default="runs/detect")
-    p_validate.add_argument("--name", type=str, default="predict")
-
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = _parse_args()
-    if args.command == "convert-labels":
-        convert_true_labels_to_yolo(
-            labels_json=args.labels_json,
-            output_root=args.output_root,
-            image_width=args.image_width,
-            image_height=args.image_height,
-            class_id=args.class_id,
-            fallback_to_fixed_box=args.fallback_to_fixed_box,
-            fallback_box_width=args.fallback_box_width,
-            fallback_box_height=args.fallback_box_height,
-        )
-    elif args.command == "validate-json":
-        run_validate_json(
-            model_path=args.model,
-            source=args.source,
-            output_json=args.output_json,
-            conf=args.conf,
-            save=args.save,
-            project=args.project,
-            name=args.name,
-        )
-    else:
-        raise SystemExit("Please select a command. Example: convert-labels or validate-json")
-
-
-if __name__ == "__main__":
-    main()
