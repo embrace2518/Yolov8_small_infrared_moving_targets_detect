@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import re
-import threading
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from queue import Empty, Full, Queue
 from typing import Any
 
 import cv2
@@ -24,23 +21,14 @@ class DatasetConfig:
     images_dir: Path | str | list[Path | str]
     labels_dir: Path | str | list[Path | str]
     preprocess_config: PipelineConfig
-    augment: bool
     target_size: tuple[int, int]
 
     cache_images: bool = True
     cache_labels: bool = True
     prefetch: bool = True
-    image_cache_size: int = 2048
-    label_cache_size: int = 4096
     max_labels: int = 300
     prefetch_workers: int = 2
     prefetch_size: int = 128
-
-    flip_prob: float = 0.5
-    rotate_prob: float = 0.3
-    rotate_degrees: int = 10
-    brightness_jitter: float = 0.2
-    contrast_jitter: float = 0.2
 
     true_labels_json_path: Path | str | None = None
     json_label_class_id: int = 0
@@ -56,31 +44,24 @@ class SequenceData:
     image_cache: OrderedDict[int, np.ndarray] = field(default_factory=OrderedDict)
     label_cache: OrderedDict[int, np.ndarray] = field(default_factory=OrderedDict)
     nuc: SceneBasedNUC | None = None
-    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     last_processed_frame: int = -1
 
     def __len__(self):
         return len(self.frame_paths)
 
-class EnhancedYOLODataset(Dataset):
+class YOLODataset(Dataset):
     def __init__(self, config: DatasetConfig, mode: str):
         self.config = config
         self.mode = mode
-        self.do_augment = mode == "train" and config.augment
-
         self.image_dirs = self._normalize_dirs(config.images_dir)
         self.label_dirs = self._normalize_dirs(config.labels_dir)
         self.target_size = config.target_size
-
-        self.flip_prob = config.flip_prob
-        self.rotate_prob = config.rotate_prob
-        self.rotate_degrees = config.rotate_degrees
-        self.brightness_jitter = config.brightness_jitter
-        self.contrast_jitter = config.contrast_jitter
-
         self.prefetch_enabled = config.prefetch
-
         self.logger = logging.getLogger(__name__)
+        self._label_json_index: dict[tuple[str | int, str | int], dict] = {}
+
+        if config.true_labels_json_path and Path(config.true_labels_json_path).exists():
+            self._load_and_index_true_labels_json(self, config.true_labels_json_path)
 
         self.sequences = self._load_sequences()
         if not self.sequences:
@@ -90,19 +71,8 @@ class EnhancedYOLODataset(Dataset):
         self._validate_annotations()
         self._init_preprocessors()
 
-        self._label_json_index: dict[tuple[str | int, str | int], dict] = {}
-        if config.true_labels_json_path and Path(config.true_labels_json_path).exists():
-            self._load_and_index_true_labels_json(self, config.true_labels_json_path)
-
-        self._prefetch_cache_lock = threading.Lock()
-        self._prefetch_cache: OrderedDict[int, tuple[np.ndarray, np.ndarray]] = OrderedDict()
-        self._prefetch_queue: Queue[int | None] = Queue(maxsize=max(64, self.config.prefetch_size * 2))
-        self._stop_prefetch = threading.Event()
-        self._prefetch_threads: list[threading.Thread] = []
         self._read_fail_count = 0
         self._read_fail_log_limit = 20
-        if self.config.prefetch:
-            self._start_prefetch_threads()
 
     @staticmethod
     def _load_and_index_true_labels_json(self, json_path: Path | str) -> None:
@@ -172,14 +142,7 @@ class EnhancedYOLODataset(Dataset):
             if candidate.exists():
                 return candidate
 
-        # 兼容旧目录：labels根下同名文件。
-        for label_dir in self.label_dirs:
-            candidate = label_dir / f"{image_path.stem}.txt"
-            if candidate.exists():
-                return candidate
-
-        # ========== 新增第4步：从JSON索引按需生成 ==========
-        # 如果以上都找不到，且我们有关联的JSON索引，则尝试从JSON生成
+        # 从JSON索引按需生成
         if self._label_json_index:
             parent_name = image_path.parent.name
             stem_name = image_path.stem
@@ -187,27 +150,22 @@ class EnhancedYOLODataset(Dataset):
             frame_match = re.search(r"(\d+)", stem_name)
             sequence_id = _to_int_or_self(seq_match.group(1)) if seq_match else parent_name
             frame = _to_int_or_self(frame_match.group(1)) if frame_match else stem_name
-            lookup_key = (sequence_id, frame)
-            json_item = self._label_json_index.get(lookup_key)
-            if json_item is not None:
-                target_label_path = same_dir_label
-                target_label_path.parent.mkdir(parents=True, exist_ok=True)
 
-                success = _generate_single_label_from_json(
+            json_item = self._label_json_index.get((sequence_id, frame))
+            if json_item is not None:
+                same_dir_label.parent.mkdir(parents=True, exist_ok=True)
+                if _generate_single_label_from_json(
                     self,
                     json_item=json_item,
-                    target_label_path=target_label_path,
-                    image_width = self.config.target_size[0],
+                    target_label_path=same_dir_label,
+                    image_width=self.config.target_size[0],
                     image_height=self.config.target_size[1],
                     class_id=self.config.json_label_class_id,
                     fallback_box_width=self.config.json_fallback_box_width,
                     fallback_box_height=self.config.json_fallback_box_height,
-                )
-                if success:
-                    return target_label_path
-            # ===================================================
-        # 4. 所有尝试都失败，返回一个（可能不存在的）占位路径
-        # （注意：原代码的“3. 兼容旧目录”步骤现在变成了第3步，这是第4步）
+                ):
+                    return same_dir_label
+
         return same_dir_label
 
     def _build_sample_index(self) -> list[tuple[int, int]]:
@@ -221,7 +179,7 @@ class EnhancedYOLODataset(Dataset):
     def _validate_annotations(self) -> None:
         """验证所有图片是否都有对应的标签文件，并报告缺失项。"""
         missing_labels = [
-            img_path.name
+            (img_path.name, str(label_path))
             for seq in self.sequences
             for img_path, label_path in zip(seq.frame_paths, seq.label_paths)
             if not label_path.exists()
@@ -247,22 +205,18 @@ class EnhancedYOLODataset(Dataset):
             "gamma": cfg.gamma,
         }
 
-        # 预先构建CLAHE和gamma LUT，避免每帧重复创建对象。
-        self._clahe = cv2.createCLAHE(
-            clipLimit=self.clahe_params["clip_limit"],
-            tileGridSize=self.clahe_params["tile_grid_size"],
-        )
+        # 预先构建 LUT，CLAHE 对象延迟实例化避免 Pickling 失败
         gamma = max(float(self.clahe_params["gamma"]), 1e-6)
         self._gamma_lut = np.array([np.clip(((i / 255.0) ** gamma) * 255.0, 0, 255) for i in range(256)], dtype=np.uint8)
+        self._clahe = None
 
     def _apply_preprocessing(self, gray_image: np.ndarray, seq: SequenceData, frame_idx: int) -> np.ndarray:
         # A策略：只对顺序帧维持NUC状态，随机跳帧时重置该序列NUC。
-        with seq.lock:
-            if seq.nuc is None or frame_idx != seq.last_processed_frame + 1:
-                seq.nuc = SceneBasedNUC(alpha=self.nuc_alpha)
-                seq.last_processed_frame = -1
-            corrected = seq.nuc.apply(gray_image)
-            seq.last_processed_frame = frame_idx
+        if seq.nuc is None or frame_idx != seq.last_processed_frame + 1:
+            seq.nuc = SceneBasedNUC(alpha=self.nuc_alpha)
+            seq.last_processed_frame = -1
+        corrected = seq.nuc.apply(gray_image)
+        seq.last_processed_frame = frame_idx
 
         denoised = denoise_frame(
             corrected,
@@ -270,6 +224,13 @@ class EnhancedYOLODataset(Dataset):
             self.denoise_params["kernel"],
             self.denoise_params["h"],
         )
+        
+        if getattr(self, "_clahe", None) is None:
+            self._clahe = cv2.createCLAHE(
+                clipLimit=self.clahe_params["clip_limit"],
+                tileGridSize=self.clahe_params["tile_grid_size"],
+            )
+
         enhanced = cv2.LUT(self._clahe.apply(denoised), self._gamma_lut)
         return enhanced
 
@@ -277,14 +238,14 @@ class EnhancedYOLODataset(Dataset):
         if not self.config.cache_images:
             return
         seq = self.sequences[seq_idx]
-        with seq.lock:
-            seq.image_cache[frame_idx] = image.copy()
+        seq.image_cache[frame_idx] = image.copy()
+        if len(seq.image_cache) > 50:  # 限制单个序列的图片缓存数量
+            seq.image_cache.popitem(last=False)
 
     def _load_image(self, seq_idx: int, frame_idx: int) -> np.ndarray:
         seq = self.sequences[seq_idx]
         if self.config.cache_images:
-            with seq.lock:
-                cached = seq.image_cache.get(frame_idx)
+            cached = seq.image_cache.get(frame_idx)
             if cached is not None:
                 return cached.copy()
 
@@ -310,14 +271,14 @@ class EnhancedYOLODataset(Dataset):
         if not self.config.cache_labels:
             return
         seq = self.sequences[seq_idx]
-        with seq.lock:
-            seq.label_cache[frame_idx] = labels.copy()
+        seq.label_cache[frame_idx] = labels.copy()
+        if len(seq.label_cache) > 200: # 限制标签缓存数量
+            seq.label_cache.popitem(last=False)
 
     def _load_yolo_labels(self, seq_idx: int, frame_idx: int) -> np.ndarray:
         seq = self.sequences[seq_idx]
         if self.config.cache_labels:
-            with seq.lock:
-                cached = seq.label_cache.get(frame_idx)
+            cached = seq.label_cache.get(frame_idx)
             if cached is not None:
                 return cached.copy()
 
@@ -332,15 +293,13 @@ class EnhancedYOLODataset(Dataset):
         with label_path.open("r", encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split()
-                if len(parts) != 5:
-                    continue
-                try:
-                    class_id, x_center, y_center, width, height = (float(v) for v in parts)
-                except ValueError:
-                    continue
-
-                if 0 <= x_center <= 1 and 0 <= y_center <= 1 and 0 <= width <= 1 and 0 <= height <= 1:
-                    labels.append([class_id, x_center, y_center, width, height])
+                if len(parts) >= 5:
+                    try:
+                        class_id, x_center, y_center, width, height = (float(v) for v in parts[:5])
+                        if 0 <= x_center <= 1 and 0 <= y_center <= 1 and 0 <= width <= 1 and 0 <= height <= 1:
+                            labels.append([class_id, x_center, y_center, width, height])
+                    except ValueError:
+                        continue
 
         if len(labels) > self.config.max_labels:
             labels = labels[: self.config.max_labels]
@@ -355,79 +314,6 @@ class EnhancedYOLODataset(Dataset):
         labels = self._load_yolo_labels(seq_idx, frame_idx)
         return image, labels
 
-    def _start_prefetch_threads(self) -> None:
-        worker_count = max(1, int(self.config.prefetch_workers))
-        for i in range(worker_count):
-            t = threading.Thread(target=self._prefetch_worker, name=f"prefetch-{i}", daemon=True)
-            t.start()
-            self._prefetch_threads.append(t)
-
-    def _schedule_prefetch(self, idx: int) -> None:
-        if not self.config.prefetch:
-            return
-
-        upper = min(len(self.samples), idx + 1 + int(self.config.prefetch_size))
-        for candidate in range(idx + 1, upper):
-            with self._prefetch_cache_lock:
-                if candidate in self._prefetch_cache:
-                    continue
-            try:
-                self._prefetch_queue.put_nowait(candidate)
-            except Full:
-                break
-
-    def _prefetch_worker(self) -> None:
-        while not self._stop_prefetch.is_set():
-            try:
-                idx = self._prefetch_queue.get(timeout=0.2)
-            except Empty:
-                continue
-
-            if idx is None:
-                self._prefetch_queue.task_done()
-                break
-
-            with self._prefetch_cache_lock:
-                if idx in self._prefetch_cache:
-                    self._prefetch_cache.move_to_end(idx)
-                    self._prefetch_queue.task_done()
-                    continue
-
-            sample = self._load_sample_raw(idx)
-            with self._prefetch_cache_lock:
-                self._prefetch_cache[idx] = sample
-                self._prefetch_cache.move_to_end(idx)
-                while len(self._prefetch_cache) > max(1, int(self.config.prefetch_size)):
-                    self._prefetch_cache.popitem(last=False)
-
-            self._prefetch_queue.task_done()
-
-    def _apply_augmentations(self, image: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if not self.do_augment:
-            return image, labels
-
-        augmented_image = image.copy()
-        augmented_labels = labels.copy()
-        h, w = image.shape[:2]
-
-        if random.random() < self.flip_prob:
-            augmented_image = cv2.flip(augmented_image, 1)
-            if len(augmented_labels) > 0:
-                augmented_labels[:, 1] = 1.0 - augmented_labels[:, 1]
-
-        if random.random() < self.rotate_prob:
-            angle = random.uniform(-self.rotate_degrees, self.rotate_degrees)
-            center = (w // 2, h // 2)
-            rot_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-            augmented_image = cv2.warpAffine(augmented_image, rot_matrix, (w, h), flags=cv2.INTER_LINEAR)
-
-        if random.random() < 0.5:
-            alpha = 1.0 + random.uniform(-self.contrast_jitter, self.contrast_jitter)
-            beta = random.uniform(-255.0 * self.brightness_jitter, 255.0 * self.brightness_jitter)
-            augmented_image = cv2.convertScaleAbs(augmented_image, alpha=alpha, beta=beta)
-
-        return augmented_image, augmented_labels
-
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
         target_h, target_w = self.target_size
         return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
@@ -435,31 +321,57 @@ class EnhancedYOLODataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        image: np.ndarray
-        labels: np.ndarray
-
-        if self.config.prefetch:
-            with self._prefetch_cache_lock:
-                cached = self._prefetch_cache.pop(idx, None)
-            if cached is not None:
-                image, labels = cached
-            else:
-                image, labels = self._load_sample_raw(idx)
-            self._schedule_prefetch(idx)
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+        image, labels = self._load_sample_raw(idx)
+        
+        # 时序堆叠：如果配置了3通道输入，我们将 t-1, t, t+1 堆叠起来
+        channels = int(getattr(self, "channels", 1))
+        
+        if channels == 3:
+            seq_idx, frame_idx = self.samples[idx]
+            seq_len = len(self.sequences[seq_idx])
+            
+            # 获取前后帧 (边界处理：超出边界则拿当前帧补)
+            prev_frame_idx = max(0, frame_idx - 1)
+            next_frame_idx = min(seq_len - 1, frame_idx + 1)
+            
+            image_prev = self._load_image(seq_idx, prev_frame_idx)
+            image_next = self._load_image(seq_idx, next_frame_idx)
+            
+            # 缩放
+            image = self._resize_image(image)
+            image_prev = self._resize_image(image_prev)
+            image_next = self._resize_image(image_next)
+            
+            # 堆叠成 HWC -> CHW 会在最后处理，当前是 HxW 的灰度图
+            stacked = np.stack([image_prev, image, image_next], axis=0) # Shape: 3 x H x W
+            image_tensor = torch.from_numpy(stacked).float() / 255.0
         else:
-            image, labels = self._load_sample_raw(idx)
-
-        image, labels = self._apply_augmentations(image, labels)
-        image = self._resize_image(image)
-
-        image_tensor = torch.from_numpy(image).float().unsqueeze(0) / 255.0
+            image = self._resize_image(image)
+            image_tensor = torch.from_numpy(image).float().unsqueeze(0) / 255.0
+        
         labels_tensor = torch.from_numpy(labels).float() if len(labels) > 0 else torch.zeros((0, 5), dtype=torch.float32)
-        return image_tensor, labels_tensor
+        return image_tensor, labels_tensor, idx
+
+    def get_yolo_sample_meta(self, idx: int, image_shape: tuple[int, int] | None = None) -> dict[str, Any]:
+        """Return lightweight metadata required by Ultralytics train/val loops."""
+        seq_idx, frame_idx = self.samples[idx]
+        seq = self.sequences[seq_idx]
+        target_h, target_w = image_shape or self.target_size
+        target_h, target_w = int(target_h), int(target_w)
+        return {
+            "im_file": str(seq.frame_paths[frame_idx]),
+            "ori_shape": (target_h, target_w),
+            "resized_shape": (target_h, target_w),
+            "ratio_pad": ((1.0, 1.0), (0.0, 0.0)),
+        }
 
     def get_image_with_boxes(self, idx: int) -> np.ndarray:
-        image_tensor, labels_tensor = self[idx]
-        image = (image_tensor.squeeze(0).numpy() * 255).astype(np.uint8)
+        image_tensor, labels_tensor, _ = self[idx]
+        if image_tensor.ndim == 3 and image_tensor.shape[0] == 3:
+            image = (image_tensor[0].numpy() * 255).astype(np.uint8)
+        else:
+            image = (image_tensor.squeeze(0).numpy() * 255).astype(np.uint8)
 
         if len(labels_tensor) > 0:
             h, w = image.shape
@@ -475,24 +387,16 @@ class EnhancedYOLODataset(Dataset):
         return image
 
     def close(self) -> None:
-        if not self.prefetch:
-            return
-        self._stop_prefetch.set()
-        for _ in self._prefetch_threads:
-            try:
-                self._prefetch_queue.put_nowait(None)
-            except Full:
-                pass
-        for t in self._prefetch_threads:
-            if t.is_alive():
-                t.join(timeout=0.5)
+        pass
 
     def __del__(self) -> None:
         self.close()
 
 
-def yolo_collate_fn_with_indices(batch: list[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor]:
-    images, targets = zip(*batch)
+def yolo_collate_fn_with_indices(
+    batch: list[tuple[torch.Tensor, torch.Tensor, int]]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    images, targets, sample_indices = zip(*batch)
     images_tensor = torch.stack(images, dim=0)
 
     all_targets = []
@@ -502,56 +406,14 @@ def yolo_collate_fn_with_indices(batch: list[tuple[torch.Tensor, torch.Tensor]])
             all_targets.append(torch.cat([indices, img_targets], dim=1))
 
     targets_tensor = torch.cat(all_targets, dim=0) if all_targets else torch.zeros((0, 6), dtype=torch.float32)
-    return images_tensor, targets_tensor
-
+    sample_indices_tensor = torch.tensor(sample_indices, dtype=torch.long)
+    return images_tensor, targets_tensor, sample_indices_tensor
 
 def _to_int_or_self(value: str) -> int | str:
     try:
         return int(value)
     except ValueError:
         return value
-
-
-def model_validate(predictions: list[Any], output_json: str | Path = "my_anno.json") -> list[dict[str, Any]]:
-    """将 YOLO predict 结果转换为验证 JSON。"""
-    validation_data: list[dict[str, Any]] = []
-
-    for result in predictions:
-        img_path = Path(str(result.path))
-        parent_name = img_path.parent.name
-        stem_name = img_path.stem
-
-        seq_match = re.search(r"(\d+)", parent_name)
-        frame_match = re.search(r"(\d+)", stem_name)
-        sequence_id = _to_int_or_self(seq_match.group(1)) if seq_match else parent_name
-        frame = _to_int_or_self(frame_match.group(1)) if frame_match else stem_name
-
-        object_coords: list[list[float]] = []
-        boxes = result.boxes
-        if boxes is not None:
-            for box in boxes.xyxy:
-                x1, y1, x2, y2 = box.tolist()
-                x_center = (x1 + x2) / 2.0
-                y_center = (y1 + y2) / 2.0
-                object_coords.append([x_center, y_center])
-
-        validation_data.append(
-            {
-                "sequence_id": sequence_id,
-                "frame": frame,
-                "num_objects": len(object_coords),
-                "object_coords": object_coords,
-            }
-        )
-
-    output_path = Path(output_json)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(validation_data, f, indent=4, ensure_ascii=False)
-
-    print(f"validation json saved: {output_path}")
-    return validation_data
-
 
 def _xyxy_to_xywh_norm(x1: float, y1: float, x2: float, y2: float, image_w: int, image_h: int) -> tuple[float, float, float, float]:
     bw = max(0.0, x2 - x1)
@@ -621,26 +483,3 @@ def _generate_single_label_from_json(self,
         print(f"[Dataset] 警告: 无法写入标签文件 {target_label_path}: {e}")
         return False
 
-
-def run_validate_json(
-    model_path: str | Path,
-    source: str | Path,
-    output_json: str | Path = "my_anno.json",
-    conf: float = 0.1,
-    save: bool = False,
-    project: str | Path = "runs/detect",
-    name: str = "predict",
-) -> list[dict[str, Any]]:
-    """A 模式：直接执行 YOLO.predict 并生成验证 JSON。"""
-    from ultralytics import YOLO
-
-    model = YOLO(str(model_path))
-    predictions = model.predict(
-        source=str(source),
-        conf=conf,
-        save=save,
-        project=str(project),
-        name=name,
-        exist_ok=True,
-    )
-    return model_validate(predictions, output_json=output_json)

@@ -1,5 +1,5 @@
-# Recommended config for RTX 3060 + infrared small targets
-# This file maps 1:1 to trainer.TrainingConfig fields.
+# Fast profile for RTX 3060 + infrared small targets
+# Use: python train.py --config train_config_fast.yaml
 
 # Dataset
 train_data_dir:
@@ -23,19 +23,19 @@ pretrained: false
 pretrained_weights: "models/yolov8.pt"
 class_names: ["target"]
 num_classes: 1
-input_channels: 3
-replicate_gray_to_3ch_for_yolo_aug: false
+input_channels: 1
+replicate_gray_to_3ch_for_yolo_aug: true
 
-# Train
-epochs: 40
-batch_size: 8
+# Train (speed-first)
+epochs: 60
+batch_size: 10
 imgsz: 640
 device: "cuda"
 optimizer: "AdamW"
-learning_rate: 0.0008
+learning_rate: 0.001
 weight_decay: 0.0005
-warmup_epochs: 3.0
-workers: 4
+warmup_epochs: 2.0
+workers: 0
 cache: false
 use_amp: true
 half: false
@@ -43,7 +43,7 @@ multi_scale: false
 
 # Augment (YOLO-side)
 augment: true
-mosaic: 0.1
+mosaic: 0.05
 mixup: 0.0
 hsv_h: 0.0
 hsv_s: 0.0
@@ -51,9 +51,9 @@ hsv_v: 0.0
 
 # Control
 seed: 42
-patience: 40
+patience: 20
 save_period: 10
-run_name: null
+run_name: "fast_rtx3060_ir"
 refresh_staging: true
 
 # Model artifact sync
