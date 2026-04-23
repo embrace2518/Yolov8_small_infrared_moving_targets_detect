@@ -356,7 +356,7 @@ class CustomTrainer:
         self.output_dir = config.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.run_name = config.run_name or datetime.now().strftime("exp_%Y%m%d_%H%M%S")
-        self.staging_root = self.output_dir / "staging" / self.run_name
+        self.staging_root = self.output_dir / "staging" / "current_run"
         self.dataset_yaml_path = self.staging_root / "dataset.yaml"
         self.last_train_results: Any = None
         self.last_val_results: Any = None
@@ -448,6 +448,110 @@ class CustomTrainer:
             yaml.safe_dump(dataset_yaml, f, sort_keys=False, allow_unicode=False)
         return self.dataset_yaml_path
 
+    def _on_epoch_end_callback(self, trainer: DetectionTrainer):
+        import shutil
+        import cv2
+        try:
+            from ultralytics.utils.ops import non_max_suppression
+        except ImportError:
+            from ultralytics.utils.nms import non_max_suppression
+
+        weights_dir = Path(trainer.save_dir) / "weights"
+        if not weights_dir.exists():
+            return
+
+        self.config.models_dir.mkdir(parents=True, exist_ok=True)
+        best_pt = weights_dir / "best.pt"
+        last_pt = weights_dir / "last.pt"
+        if best_pt.exists():
+            shutil.copy2(best_pt, self.config.models_dir / "yolov8_best.pt")
+        if last_pt.exists():
+            shutil.copy2(last_pt, self.config.models_dir / "yolov8_last.pt")
+
+        is_last_epoch = (trainer.epoch == trainer.epochs - 1)
+        is_10th_epoch = ((trainer.epoch + 1) % 10 == 0)
+
+        if not is_last_epoch and not is_10th_epoch:
+            return
+
+        val_loader = getattr(trainer, 'custom_val_loader', None)
+        if not val_loader: return
+        dataset = val_loader.dataset
+        device = trainer.device
+        model = trainer.ema.ema if getattr(trainer, 'ema', None) else trainer.model
+        model.eval()
+
+        out_dir = Path(trainer.save_dir) / "epoch_visuals" / f"epoch_{trainer.epoch}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # 预计算 sequence index 对应的 sample indices 加快查找
+        seq_to_samples = {}
+        for idx, (s_idx, f_idx) in enumerate(dataset.samples):
+            seq_to_samples.setdefault(s_idx, []).append(idx)
+
+        for seq_idx, seq in enumerate(dataset.sequences):
+            # 限流：如果不是最后一轮，仅输出1个序列的一张图片
+            if not is_last_epoch and seq_idx >= 1:
+                break
+
+            frames_to_check = seq_to_samples.get(seq_idx, [])
+            if not frames_to_check: continue
+
+            frames_to_check = frames_to_check[::5]
+
+            highest_conf = -1.0
+            best_img_info = None
+
+            for sample_idx in frames_to_check:
+                image_tensor, labels_tensor, _ = dataset[sample_idx]
+                img_batch = image_tensor.unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    preds = model(img_batch)
+                    p = non_max_suppression(preds, conf_thres=0.1, iou_thres=0.45)[0]
+
+                has_det = len(p) > 0
+                max_c = p[:, 4].max().item() if has_det else 0.0
+
+                if max_c > highest_conf:
+                    highest_conf = max_c
+                    best_img_info = (sample_idx, image_tensor, labels_tensor, p)
+
+                # 如果有识别到物体且置信度过关，视为"首个成功"->直接跳出当前序列
+                if has_det and max_c > 0.5:
+                    break
+
+            if best_img_info is not None:
+                _, img_t, lbl_t, p_t = best_img_info
+
+                if img_t.shape[0] == 3:
+                    img = (img_t[1].cpu().numpy() * 255).astype(np.uint8)
+                else:
+                    img = (img_t[0].cpu().numpy() * 255).astype(np.uint8)
+
+                img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                h_img, w_img = img_color.shape[:2]
+
+                # 绘制 GT 真实框 (绿色)
+                for lbl in lbl_t:
+                    if len(lbl) >= 5:
+                        cx, cy, bw, bh = lbl[1:5].numpy()
+                        x1 = int((cx - bw / 2) * w_img)
+                        y1 = int((cy - bh / 2) * h_img)
+                        x2 = int((cx + bw / 2) * w_img)
+                        y2 = int((cy + bh / 2) * h_img)
+                        cv2.rectangle(img_color, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(img_color, "GT", (x1, max(y1 - 5, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+                # 绘制 Pred 预测框 (红色)
+                for det in p_t:
+                    x1, y1, x2, y2, conf, cls = det.cpu().numpy()
+                    cv2.rectangle(img_color, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 1)
+                    cv2.putText(img_color, f"{conf:.2f}", (int(x1), max(int(y1) - 15, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+                save_path = out_dir / f"{seq.name}_best.jpg"
+                cv2.imwrite(str(save_path), img_color)
+
     def train(self, resume_from: Optional[Path] = None) -> Any:
         resume_flag: bool = False
         if resume_from and Path(resume_from).exists():
@@ -458,6 +562,8 @@ class CustomTrainer:
             print(f"[Trainer] not found: {resume_from}")
 
         dataset_yaml = self.stage_dataset_yaml()
+
+        self.model.add_callback("on_fit_epoch_end", self._on_epoch_end_callback)
 
         train_args = dict(
             # 基本训练参数
@@ -506,28 +612,10 @@ class CustomTrainer:
         self.last_train_results = self.model.train(**train_args)
 
         # 归档最佳模型并绘制结果图表
-        self._archive_best_model()
         self._plot_results()
 
         return self.last_train_results
 
-    def _archive_best_model(self):
-        import shutil
-        weights_dir = self.output_dir.absolute() / self.run_name / "weights"
-        best_pt = weights_dir / "best.pt"
-        last_pt = weights_dir / "last.pt"
-
-        self.config.models_dir.mkdir(parents=True, exist_ok=True)
-
-        if best_pt.exists():
-            target_pt = self.config.models_dir / "yolov8_best.pt"
-            shutil.copy2(best_pt, target_pt)
-            print(f"[Trainer] 最佳模型已归档至: {target_pt}")
-
-        if last_pt.exists():
-            target_last_pt = self.config.models_dir / "yolov8_last.pt"
-            shutil.copy2(last_pt, target_last_pt)
-            print(f"[Trainer] 最新模型已归档至: {target_last_pt}")
 
     def _plot_results(self):
         csv_file = self.output_dir.absolute() / self.run_name / "results.csv"

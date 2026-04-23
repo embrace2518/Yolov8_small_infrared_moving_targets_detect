@@ -31,8 +31,8 @@ class_id x_center y_center width height
 
 ```powershell
 python train.py --config train_config.yaml
-python train.py --config train_config.yaml --device cpu
-python train.py --config train_config.yaml --resume weights\last.pt
+
+python train.py --config train_config.yaml --resume weights\yolov8_last.pt
 ```
 
 ## 4) 推理

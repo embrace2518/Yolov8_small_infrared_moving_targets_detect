@@ -205,10 +205,23 @@ class YOLODataset(Dataset):
             "gamma": cfg.gamma,
         }
 
-        # 预先构建 LUT，CLAHE 对象延迟实例化避免 Pickling 失败
+        # 预先构建 LUT
         gamma = max(float(self.clahe_params["gamma"]), 1e-6)
         self._gamma_lut = np.array([np.clip(((i / 255.0) ** gamma) * 255.0, 0, 255) for i in range(256)], dtype=np.uint8)
+
+    def __getstate__(self):
+        # 移除不可序列化的C++对象
+        state = self.__dict__.copy()
+        state.pop("_clahe", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # 恢复状态时，置空 CLAHE 这样每个子进程可自行创建
         self._clahe = None
+
+        # 如果 _label_json_index 是空字典，不影响
+        pass
 
     def _apply_preprocessing(self, gray_image: np.ndarray, seq: SequenceData, frame_idx: int) -> np.ndarray:
         # A策略：只对顺序帧维持NUC状态，随机跳帧时重置该序列NUC。
