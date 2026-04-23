@@ -56,12 +56,13 @@ def patched_bbox_iou(box1, box2, xywh=False, GIoU=False, DIoU=False, CIoU=False,
     # Calculate regular CIoU (or standard IoU depending on flags)
     iou = original_bbox_iou(box1, box2, xywh, GIoU, DIoU, CIoU, eps)
     
-    # Calculate NWD to augment label assignment & CIoU loss for tiny targets
-    if not xywh:
+    # Calculate NWD ONLY to augment label assignment (TAL Assigner).
+    # We strictly avoid modifying the Bbox Loss (where CIoU is typically True)
+    # to prevent extreme gradient vanishing for distant initial predictions.
+    if not xywh and not CIoU:
         nwd = bbox_nwd(box1, box2, eps)
-        # 强制与 iou 的维度对其，避免任何意外的张量广播
         nwd = nwd.view(iou.shape)
-        # NWD heavily compensates when standard IoU is mostly zero.
+        # NWD heavily compensates when standard IoU is mostly zero in tiny targets.
         return 0.5 * iou.clamp(0) + 0.5 * nwd
     return iou
 
@@ -477,7 +478,7 @@ class CustomTrainer:
             seed=self.config.seed,
             patience=self.config.patience,
             save_period=self.config.save_period,
-            project=str(self.output_dir),
+            project=str(self.output_dir.absolute()),
             name=self.run_name,
             exist_ok=True,
             resume=resume_flag,
@@ -503,15 +504,89 @@ class CustomTrainer:
             val_loader=self.val_loader,
         )
         self.last_train_results = self.model.train(**train_args)
+
+        # 归档最佳模型并绘制结果图表
+        self._archive_best_model()
+        self._plot_results()
+
         return self.last_train_results
+
+    def _archive_best_model(self):
+        import shutil
+        weights_dir = self.output_dir.absolute() / self.run_name / "weights"
+        best_pt = weights_dir / "best.pt"
+        last_pt = weights_dir / "last.pt"
+
+        self.config.models_dir.mkdir(parents=True, exist_ok=True)
+
+        if best_pt.exists():
+            target_pt = self.config.models_dir / "yolov8_best.pt"
+            shutil.copy2(best_pt, target_pt)
+            print(f"[Trainer] 最佳模型已归档至: {target_pt}")
+
+        if last_pt.exists():
+            target_last_pt = self.config.models_dir / "yolov8_last.pt"
+            shutil.copy2(last_pt, target_last_pt)
+            print(f"[Trainer] 最新模型已归档至: {target_last_pt}")
+
+    def _plot_results(self):
+        csv_file = self.output_dir.absolute() / self.run_name / "results.csv"
+        if not csv_file.exists():
+            return
+
+        try:
+            import pandas as pd
+            import matplotlib.pyplot as plt
+
+            df = pd.read_csv(csv_file)
+            df.columns = df.columns.str.strip()  # 移除列名空格
+
+            fig, ax1 = plt.subplots(figsize=(10, 6))
+
+            # 绘制 Loss
+            if 'train/box_loss' in df.columns:
+                ax1.plot(df['epoch'], df['train/box_loss'], label='Train Box Loss', color='blue', linestyle='-')
+            if 'val/box_loss' in df.columns:
+                ax1.plot(df['epoch'], df['val/box_loss'], label='Val Box Loss', color='cyan', linestyle='--')
+
+            ax1.set_xlabel('Epoch')
+            ax1.set_ylabel('Loss', color='blue')
+            ax1.tick_params(axis='y', labelcolor='blue')
+
+            # 绘制 mAP
+            ax2 = ax1.twinx()
+            map_col = next((col for col in df.columns if 'mAP50-95' in col), None)
+            if map_col:
+                ax2.plot(df['epoch'], df[map_col], label='mAP50-95', color='red', linestyle='-')
+
+            ax2.set_ylabel('mAP', color='red')
+            ax2.tick_params(axis='y', labelcolor='red')
+
+            # 合并图例
+            lines_1, labels_1 = ax1.get_legend_handles_labels()
+            lines_2, labels_2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right')
+
+            plt.title('Training Learning Curves')
+            fig.tight_layout()
+
+            plot_path = self.output_dir.absolute() / self.run_name / "learning_curves.png"
+            plt.savefig(plot_path)
+            plt.close()
+            print(f"[Trainer] 训练曲线已保存至: {plot_path}")
+
+        except ImportError:
+            print("[Trainer] 未安装 pandas 或 matplotlib，跳过曲线绘制。")
+        except Exception as e:
+            print(f"[Trainer] 绘制结果曲线时出错: {e}")
 
     def _resolve_eval_model(self, model_path: Optional[str] = None) -> tuple[YOLO, str]:
         if model_path and Path(model_path).exists():
             return YOLO(model_path), str(model_path)
         print(f"[Trainer] evaluate model path not found, fallback to in-memory model: {model_path}")
 
-        best_path = Path("models/best.pt")
-        last_path = Path("models/last.pt")
+        best_path = Path("models/yolov8_best.pt")
+        last_path = Path("models/yolov8_last.pt")
         if best_path.exists():
             return YOLO(str(best_path)), str(best_path)
         if last_path.exists():
@@ -569,7 +644,7 @@ class CustomTrainer:
             workers=self.config.workers,
             half=self.config.half and self.device.startswith("cuda"),
             split="val",
-            project=str(self.output_dir),
+            project=str(self.output_dir.absolute()),
             name=f"{self.run_name}_val",
             exist_ok=True,
             plots=False,
