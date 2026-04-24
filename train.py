@@ -27,12 +27,39 @@ def load_training_config(config_path: str) -> TrainingConfig:
 
     return TrainingConfig(**filtered)
 
+def plot_learning_curve(csv_path: Path | str, save_dir: Path | str):
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    try:
+        df = pd.read_csv(csv_path)
+        df.columns = df.columns.str.strip()
+        plt.figure(figsize=(10, 5))
+        if 'metrics/mAP50(B)' in df.columns:
+            plt.plot(df['epoch'], df['metrics/mAP50(B)'], marker='o', label='mAP@50')
+        if 'train/box_loss' in df.columns:
+            plt.plot(df['epoch'], df['train/box_loss'], marker='x', label='Train Box Loss')
+        plt.title('Training Learning Curve')
+        plt.xlabel('Epoch')
+        plt.ylabel('Score / Loss')
+        plt.grid()
+        plt.legend()
+        out_file = Path(save_dir) / "custom_learning_curve.png"
+        plt.savefig(str(out_file))
+        plt.close()
+        print(f"[Learning Curve] Saved to {out_file}")
+    except Exception as e:
+        print(f"[Learning Curve] Failed to plot: {e}")
+
 def main() -> None:
     args = parse_args()
     config = load_training_config(args.config)
     trainer = CustomTrainer(config)
     trainer.train(resume_from=Path(args.resume) if args.resume else None)
-    trainer.evaluate()
+
+    # Draw learning curve independently
+    csv_path = trainer.output_dir / trainer.run_name / "results.csv"
+    if csv_path.exists():
+        plot_learning_curve(csv_path, trainer.output_dir / trainer.run_name)
 
     # == Run Custom Domain spotGEO Validation after default YOLOv8 Evaluation == #
     print("\n[train.py] Running ESA spotGEO custom validation on validation set...")
@@ -40,34 +67,8 @@ def main() -> None:
     best_weights_path = trainer.output_dir / trainer.run_name / "weights" / "best.pt"
     
     if best_weights_path.exists():
-        from validation import run_validate_json, compute_score
-        out_json_path = trainer.output_dir / f"{trainer.run_name}_val" / "val_predictions.json"
-        
-        # 1. 运行预测生成JSON
-        run_validate_json(
-            model_path=best_weights_path,
-            source=val_source,
-            output_json=out_json_path,
-            conf=0.05,        # 稍低阈值获取召回率
-            project=trainer.output_dir,
-            name=f"{trainer.run_name}_val_custom"
-        )
-        
-        print(f"[train.py] Custom prediction output saved to {out_json_path}")
-        
-        # 2. 如果存在真实标签 true_labels_json_path，自动进行赛道得分评测
-        true_labels_json = config.pre_config_path.parent / "true_labels.json"
-        if true_labels_json.exists():
-            score, mse = compute_score(str(out_json_path), str(true_labels_json))
-            print(f"\n======================================")
-            print(f"🌟 END OF TRAINING: spotGEO COMPETITION SCORE 🌟")
-            print(f"Score (1 - F1): {score:0.6f}")
-            print(f"MSE           : {mse:0.6f}")
-            print(f"======================================\n")
-        else:
-            print(f"[train.py] Note: Could not find '{true_labels_json}', skipping exact score computation.")
-    else:
-        print("[train.py] Warning: best.pt not found, skipping custom validation.")
+        from validation import model_validate
+        model_validate(best_weights_path, str(val_source))
 
 if __name__ == "__main__":
     main()

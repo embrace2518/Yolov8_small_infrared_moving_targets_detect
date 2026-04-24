@@ -206,7 +206,7 @@ class YOLODataset(Dataset):
         }
 
         # 预先构建 LUT
-        gamma = max(float(self.clahe_params["gamma"]), 1e-6)
+        gamma = max(float(self.clahe_params.get("gamma", 0.95)), 1e-6)
         self._gamma_lut = np.array([np.clip(((i / 255.0) ** gamma) * 255.0, 0, 255) for i in range(256)], dtype=np.uint8)
 
     def __getstate__(self):
@@ -233,15 +233,17 @@ class YOLODataset(Dataset):
 
         denoised = denoise_frame(
             corrected,
-            self.denoise_params["method"],
-            self.denoise_params["kernel"],
-            self.denoise_params["h"],
+            str(self.denoise_params["method"]),
+            int(self.denoise_params["kernel"]),
+            int(self.denoise_params["h"]),
         )
         
         if getattr(self, "_clahe", None) is None:
+            # Type cast to satisfy strict dict types
+            tg_size = self.clahe_params["tile_grid_size"]
             self._clahe = cv2.createCLAHE(
-                clipLimit=self.clahe_params["clip_limit"],
-                tileGridSize=self.clahe_params["tile_grid_size"],
+                clipLimit=float(self.clahe_params["clip_limit"]),
+                tileGridSize=tg_size if isinstance(tg_size, tuple) else (8, 8),
             )
 
         enhanced = cv2.LUT(self._clahe.apply(denoised), self._gamma_lut)
@@ -356,13 +358,28 @@ class YOLODataset(Dataset):
             image_prev = self._resize_image(image_prev)
             image_next = self._resize_image(image_next)
             
-            # 堆叠成 HWC -> CHW 会在最后处理，当前是 HxW 的灰度图
-            stacked = np.stack([image_prev, image, image_next], axis=0) # Shape: 3 x H x W
-            image_tensor = torch.from_numpy(stacked).float() / 255.0
+            # 堆叠成 HWC -> CHW，Shape: 3 x H x W
+            stacked = np.stack([image_prev, image, image_next], axis=0)
         else:
             image = self._resize_image(image)
-            image_tensor = torch.from_numpy(image).float().unsqueeze(0) / 255.0
-        
+            stacked = image[np.newaxis, ...] # Shape: 1 x H x W
+
+        # 优化：在 DataLoader 端加入强力的数据增强（解决 Bypass YOLO Transformer 的问题），保持时序一致性
+        if self.mode == "train":
+            # 随机水平翻转
+            if np.random.rand() < 0.5:
+                stacked = np.flip(stacked, axis=2).copy()
+                if len(labels) > 0:
+                    labels[:, 1] = 1.0 - labels[:, 1]
+
+            # 随机垂直翻转
+            if np.random.rand() < 0.5:
+                stacked = np.flip(stacked, axis=1).copy()
+                if len(labels) > 0:
+                    labels[:, 2] = 1.0 - labels[:, 2]
+
+        # 优化：直接返回 uint8 张量，将除以 255.0 以及转 float 的算力推延到 GPU 端进行，节约 75% 的 PCIe 数据带宽
+        image_tensor = torch.from_numpy(stacked)
         labels_tensor = torch.from_numpy(labels).float() if len(labels) > 0 else torch.zeros((0, 5), dtype=torch.float32)
         return image_tensor, labels_tensor, idx
 
@@ -381,10 +398,15 @@ class YOLODataset(Dataset):
 
     def get_image_with_boxes(self, idx: int) -> np.ndarray:
         image_tensor, labels_tensor, _ = self[idx]
-        if image_tensor.ndim == 3 and image_tensor.shape[0] == 3:
-            image = (image_tensor[0].numpy() * 255).astype(np.uint8)
+        if image_tensor.dtype == torch.uint8:
+            image = image_tensor.numpy()
         else:
-            image = (image_tensor.squeeze(0).numpy() * 255).astype(np.uint8)
+            image = (image_tensor.numpy() * 255).astype(np.uint8)
+
+        if image.ndim == 3 and image.shape[0] == 3:
+            image = image[1]  # 提取中间帧
+        else:
+            image = image.squeeze(0)
 
         if len(labels_tensor) > 0:
             h, w = image.shape

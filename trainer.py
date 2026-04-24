@@ -8,13 +8,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import os
+import copy
 from collections.abc import Sized
 from typing import Any, Optional, cast
 
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, Sampler, BatchSampler, SequentialSampler
+from torch.utils.data import DataLoader, Sampler
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.models.yolo.detect import DetectionTrainer
@@ -56,6 +57,12 @@ def patched_bbox_iou(box1, box2, xywh=False, GIoU=False, DIoU=False, CIoU=False,
     # Calculate regular CIoU (or standard IoU depending on flags)
     iou = original_bbox_iou(box1, box2, xywh, GIoU, DIoU, CIoU, eps)
     
+    # 全局开关判定：如果正在调用 NWD，需要检查是否正处于验证阶段。
+    # 避免 NWD 破坏原有的评估 mAP 的 IOU 阈值标准！
+    in_validation = getattr(torch, '_v2_validation_in_progress', False)
+    if in_validation or not torch.is_grad_enabled():
+        return iou
+
     # Calculate NWD ONLY to augment label assignment (TAL Assigner).
     # We strictly avoid modifying the Bbox Loss (where CIoU is typically True)
     # to prevent extreme gradient vanishing for distant initial predictions.
@@ -165,6 +172,23 @@ class DataLoaderCompatibleTrainer(DetectionTrainer):
         else:
             super().__init__(cfg=cfg, overrides=custom_overrides, _callbacks=_callbacks)
 
+    def get_validator(self):
+        """Override to use our DataLoaderCompatibleValidator during epoch validation"""
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        val_args = vars(self.args).copy() if hasattr(self.args, '__dict__') else getattr(self, 'args', {}).copy()
+
+        # force disable YOLO default plots which locks up processes
+        val_args["plots"] = False
+        # pass in custom_val_loader so the validator overrides its own dataloader
+        val_args["val_loader"] = getattr(self, 'custom_val_loader', None)
+
+        validator = DataLoaderCompatibleValidator(
+            dataloader=self.test_loader if hasattr(self, 'test_loader') else self.custom_val_loader,
+            save_dir=self.save_dir,
+            args=val_args
+        )
+        return validator
+
     def get_dataset(self):
         """绕过底层yaml文件检查，直接返回虚拟数据集信息供YOLO构建Loss和Metrics"""
         active_loader = self.custom_train_loader or self.custom_val_loader
@@ -222,6 +246,14 @@ class DataLoaderCompatibleValidator(DetectionValidator):
                 self._logged_custom_val_loader = True
             return self.dataloader
         return super().get_dataloader(dataset_path, batch_size)
+
+    def __call__(self, trainer=None, model=None):
+        # 开启验证阶段 NWD 的锁定标志
+        setattr(torch, '_v2_validation_in_progress', True)
+        try:
+            return super().__call__(trainer, model)
+        finally:
+            setattr(torch, '_v2_validation_in_progress', False)
 
 
 class YOLOLoaderAdapter:
@@ -304,6 +336,7 @@ class SequenceBatchSampler(Sampler[list[int]]):
     hit the cache efficiently, and `DataLoader` gets enough items in multithreaded workers.
     """
     def __init__(self, dataset: YOLODataset, batch_size: int, drop_last: bool, shuffle: bool = True):
+        super().__init__(None) # PyTorch Sampler initialization
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
@@ -424,8 +457,8 @@ class CustomTrainer:
         )
 
     def create_dataloaders(self) -> tuple[DataLoader, DataLoader]:
-        train_dataset = self._make_dataset(self.config.train_data_dir, mode="train")
-        val_dataset = self._make_dataset(self.config.val_data_dir, mode="val")
+        train_dataset = self._make_dataset(cast(list[Path], self.config.train_data_dir), mode="train")
+        val_dataset = self._make_dataset(cast(list[Path], self.config.val_data_dir), mode="val")
         return self._make_loader(train_dataset, shuffle=True), self._make_loader(val_dataset, shuffle=False)
 
     def stage_dataset_yaml(self) -> Path:
@@ -449,12 +482,11 @@ class CustomTrainer:
         return self.dataset_yaml_path
 
     def _on_epoch_end_callback(self, trainer: DetectionTrainer):
+        # 仅在主进程运行 ( rank 0 或者是单卡 )
+        if getattr(trainer, 'rank', 0) not in (-1, 0):
+            return
+
         import shutil
-        import cv2
-        try:
-            from ultralytics.utils.ops import non_max_suppression
-        except ImportError:
-            from ultralytics.utils.nms import non_max_suppression
 
         weights_dir = Path(trainer.save_dir) / "weights"
         if not weights_dir.exists():
@@ -467,90 +499,6 @@ class CustomTrainer:
             shutil.copy2(best_pt, self.config.models_dir / "yolov8_best.pt")
         if last_pt.exists():
             shutil.copy2(last_pt, self.config.models_dir / "yolov8_last.pt")
-
-        is_last_epoch = (trainer.epoch == trainer.epochs - 1)
-        is_10th_epoch = ((trainer.epoch + 1) % 10 == 0)
-
-        if not is_last_epoch and not is_10th_epoch:
-            return
-
-        val_loader = getattr(trainer, 'custom_val_loader', None)
-        if not val_loader: return
-        dataset = val_loader.dataset
-        device = trainer.device
-        model = trainer.ema.ema if getattr(trainer, 'ema', None) else trainer.model
-        model.eval()
-
-        out_dir = Path(trainer.save_dir) / "epoch_visuals" / f"epoch_{trainer.epoch}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # 预计算 sequence index 对应的 sample indices 加快查找
-        seq_to_samples = {}
-        for idx, (s_idx, f_idx) in enumerate(dataset.samples):
-            seq_to_samples.setdefault(s_idx, []).append(idx)
-
-        for seq_idx, seq in enumerate(dataset.sequences):
-            # 限流：如果不是最后一轮，仅输出1个序列的一张图片
-            if not is_last_epoch and seq_idx >= 1:
-                break
-
-            frames_to_check = seq_to_samples.get(seq_idx, [])
-            if not frames_to_check: continue
-
-            frames_to_check = frames_to_check[::5]
-
-            highest_conf = -1.0
-            best_img_info = None
-
-            for sample_idx in frames_to_check:
-                image_tensor, labels_tensor, _ = dataset[sample_idx]
-                img_batch = image_tensor.unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    preds = model(img_batch)
-                    p = non_max_suppression(preds, conf_thres=0.1, iou_thres=0.45)[0]
-
-                has_det = len(p) > 0
-                max_c = p[:, 4].max().item() if has_det else 0.0
-
-                if max_c > highest_conf:
-                    highest_conf = max_c
-                    best_img_info = (sample_idx, image_tensor, labels_tensor, p)
-
-                # 如果有识别到物体且置信度过关，视为"首个成功"->直接跳出当前序列
-                if has_det and max_c > 0.5:
-                    break
-
-            if best_img_info is not None:
-                _, img_t, lbl_t, p_t = best_img_info
-
-                if img_t.shape[0] == 3:
-                    img = (img_t[1].cpu().numpy() * 255).astype(np.uint8)
-                else:
-                    img = (img_t[0].cpu().numpy() * 255).astype(np.uint8)
-
-                img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-                h_img, w_img = img_color.shape[:2]
-
-                # 绘制 GT 真实框 (绿色)
-                for lbl in lbl_t:
-                    if len(lbl) >= 5:
-                        cx, cy, bw, bh = lbl[1:5].numpy()
-                        x1 = int((cx - bw / 2) * w_img)
-                        y1 = int((cy - bh / 2) * h_img)
-                        x2 = int((cx + bw / 2) * w_img)
-                        y2 = int((cy + bh / 2) * h_img)
-                        cv2.rectangle(img_color, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(img_color, "GT", (x1, max(y1 - 5, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-
-                # 绘制 Pred 预测框 (红色)
-                for det in p_t:
-                    x1, y1, x2, y2, conf, cls = det.cpu().numpy()
-                    cv2.rectangle(img_color, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 1)
-                    cv2.putText(img_color, f"{conf:.2f}", (int(x1), max(int(y1) - 15, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-
-                save_path = out_dir / f"{seq.name}_best.jpg"
-                cv2.imwrite(str(save_path), img_color)
 
     def train(self, resume_from: Optional[Path] = None) -> Any:
         resume_flag: bool = False
@@ -565,188 +513,60 @@ class CustomTrainer:
 
         self.model.add_callback("on_fit_epoch_end", self._on_epoch_end_callback)
 
-        train_args = dict(
-            # 基本训练参数
-            epochs=self.config.epochs,
-            imgsz=self.config.imgsz,
-            batch=self.config.batch_size,
-            device=self.device,
-            workers=self.config.workers,
-            data=str(dataset_yaml),
-
-            # 优化器参数
-            optimizer=self.config.optimizer,
-            lr0=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            warmup_epochs=self.config.warmup_epochs,
-
-            # 训练控制
-            seed=self.config.seed,
-            patience=self.config.patience,
-            save_period=self.config.save_period,
-            project=str(self.output_dir.absolute()),
-            name=self.run_name,
-            exist_ok=True,
-            resume=resume_flag,
-
-            # 性能相关
-            amp=self.config.use_amp,
-            half=self.config.half and self.device.startswith("cuda"),
-            cache=self.config.cache,
-            plots=False,
-            close_mosaic=0,
-
-            # 数据增强（交由YOLO）
-            augment=self.config.augment,
-            multi_scale=self.config.multi_scale,
-            mosaic=float(self.config.mosaic),
-            mixup=float(self.config.mixup),
-            # Redundant safety: for infrared grayscale, disable color jitter.
-            hsv_h=0.0 if self.config.input_channels == 1 else float(self.config.hsv_h),
-            hsv_s=0.0 if self.config.input_channels == 1 else float(self.config.hsv_s),
-            hsv_v=0.0 if self.config.input_channels == 1 else float(self.config.hsv_v),
-            trainer=DataLoaderCompatibleTrainer,
-            train_loader=self.train_loader,
-            val_loader=self.val_loader,
-        )
-        self.last_train_results = self.model.train(**train_args)
-
-        # 归档最佳模型并绘制结果图表
-        self._plot_results()
-
-        return self.last_train_results
-
-
-    def _plot_results(self):
-        csv_file = self.output_dir.absolute() / self.run_name / "results.csv"
-        if not csv_file.exists():
-            return
-
-        try:
-            import pandas as pd
-            import matplotlib.pyplot as plt
-
-            df = pd.read_csv(csv_file)
-            df.columns = df.columns.str.strip()  # 移除列名空格
-
-            fig, ax1 = plt.subplots(figsize=(10, 6))
-
-            # 绘制 Loss
-            if 'train/box_loss' in df.columns:
-                ax1.plot(df['epoch'], df['train/box_loss'], label='Train Box Loss', color='blue', linestyle='-')
-            if 'val/box_loss' in df.columns:
-                ax1.plot(df['epoch'], df['val/box_loss'], label='Val Box Loss', color='cyan', linestyle='--')
-
-            ax1.set_xlabel('Epoch')
-            ax1.set_ylabel('Loss', color='blue')
-            ax1.tick_params(axis='y', labelcolor='blue')
-
-            # 绘制 mAP
-            ax2 = ax1.twinx()
-            map_col = next((col for col in df.columns if 'mAP50-95' in col), None)
-            if map_col:
-                ax2.plot(df['epoch'], df[map_col], label='mAP50-95', color='red', linestyle='-')
-
-            ax2.set_ylabel('mAP', color='red')
-            ax2.tick_params(axis='y', labelcolor='red')
-
-            # 合并图例
-            lines_1, labels_1 = ax1.get_legend_handles_labels()
-            lines_2, labels_2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right')
-
-            plt.title('Training Learning Curves')
-            fig.tight_layout()
-
-            plot_path = self.output_dir.absolute() / self.run_name / "learning_curves.png"
-            plt.savefig(plot_path)
-            plt.close()
-            print(f"[Trainer] 训练曲线已保存至: {plot_path}")
-
-        except ImportError:
-            print("[Trainer] 未安装 pandas 或 matplotlib，跳过曲线绘制。")
-        except Exception as e:
-            print(f"[Trainer] 绘制结果曲线时出错: {e}")
-
-    def _resolve_eval_model(self, model_path: Optional[str] = None) -> tuple[YOLO, str]:
-        if model_path and Path(model_path).exists():
-            return YOLO(model_path), str(model_path)
-        print(f"[Trainer] evaluate model path not found, fallback to in-memory model: {model_path}")
-
-        best_path = Path("models/yolov8_best.pt")
-        last_path = Path("models/yolov8_last.pt")
-        if best_path.exists():
-            return YOLO(str(best_path)), str(best_path)
-        if last_path.exists():
-            return YOLO(str(last_path)), str(last_path)
-        return self.model, str(self.model_source)
-
-    @staticmethod
-    def _summarize_val_results(results: Any) -> dict[str, float]:
-        summary: dict[str, float] = {}
-        if results is None:
-            return summary
-
-        results_dict = getattr(results, "results_dict", None)
-        if isinstance(results_dict, dict):
-            for key, value in results_dict.items():
-                try:
-                    summary[str(key)] = float(value)
-                except (TypeError, ValueError):
-                    continue
-
-        box_metrics = getattr(results, "box", None)
-        for attr_name, output_name in (
-            ("map", "metrics/box_map50_95"),
-            ("map50", "metrics/box_map50"),
-            ("map75", "metrics/box_map75"),
-            ("mp", "metrics/precision"),
-            ("mr", "metrics/recall"),
-        ):
-            value = getattr(box_metrics, attr_name, None) if box_metrics is not None else None
-            if value is not None:
-                try:
-                    summary[output_name] = float(value)
-                except (TypeError, ValueError):
-                    pass
-        return summary
-
-    def evaluate(self, model_path: Optional[str] = None) -> Any:
-        val_dataset = getattr(self.val_loader, "dataset", None)
-        val_size = len(val_dataset) if isinstance(val_dataset, Sized) else -1
-        if val_size == 0:
-            print("[Trainer] validation skipped: val dataset is empty")
-            self.last_val_results = None
-            self.last_val_metrics = {}
-            return None
-        eval_model = self._resolve_eval_model(model_path)
-        print(f"[Trainer] evaluate model={model_path}")
-        print(f"[Trainer] validation images={val_size}")
-        dataset_yaml = self.stage_dataset_yaml()
-
-        val_args = dict(
-            data=str(dataset_yaml),
-            imgsz=self.config.imgsz,
-            batch=self.config.batch_size,
-            device=self.device,
-            workers=self.config.workers,
-            half=self.config.half and self.device.startswith("cuda"),
-            split="val",
-            project=str(self.output_dir.absolute()),
-            name=f"{self.run_name}_val",
-            exist_ok=True,
-            plots=False,
-            save_json=False,
-            save_txt=False,
-            val_loader=self.val_loader,
-        )
-        self.last_val_results = eval_model.val(validator=DataLoaderCompatibleValidator, **val_args)
-        self.last_val_metrics = self._summarize_val_results(self.last_val_results)
-        if self.last_val_metrics:
-            print("[Trainer] validation summary:")
-            for key in sorted(self.last_val_metrics):
-                print(f"  - {key}: {self.last_val_metrics[key]:.6f}")
+        if resume_flag:
+            train_args = dict(
+                resume=True,
+                data=str(dataset_yaml),
+                epochs=self.config.epochs,  # 只允许扩展 Epoch 总数
+                trainer=DataLoaderCompatibleTrainer,
+                train_loader=self.train_loader,
+                val_loader=self.val_loader,
+            )
         else:
-            print("[Trainer] validation finished, but no numeric metrics were returned")
-        return self.last_val_results
+            train_args = dict(
+                # 基本训练参数
+                epochs=self.config.epochs,
+                imgsz=self.config.imgsz,
+                batch=self.config.batch_size,
+                device=self.device,
+                workers=self.config.workers,
+                data=str(dataset_yaml),
 
+                # 优化器参数
+                optimizer=self.config.optimizer,
+                lr0=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
+                warmup_epochs=self.config.warmup_epochs,
+
+                # 训练控制
+                seed=self.config.seed,
+                patience=self.config.patience,
+                save_period=self.config.save_period,
+                project=str(self.output_dir.absolute()),
+                name=self.run_name,
+                exist_ok=True,
+
+                # 性能相关
+                amp=self.config.use_amp,
+                half=self.config.half and self.device.startswith("cuda"),
+                cache=self.config.cache,
+                plots=False,
+                close_mosaic=0,
+
+                # 数据增强（交由YOLO）
+                augment=self.config.augment,
+                multi_scale=self.config.multi_scale,
+                mosaic=float(self.config.mosaic),
+                mixup=float(self.config.mixup),
+                # Redundant safety: for infrared grayscale, disable color jitter.
+                hsv_h=0.0 if self.config.input_channels == 1 else float(self.config.hsv_h),
+                hsv_s=0.0 if self.config.input_channels == 1 else float(self.config.hsv_s),
+                hsv_v=0.0 if self.config.input_channels == 1 else float(self.config.hsv_v),
+
+                trainer=DataLoaderCompatibleTrainer,
+                train_loader=self.train_loader,
+                val_loader=self.val_loader,
+            )
+
+        self.last_train_results = self.model.train(**train_args)
+        return self.last_train_results
