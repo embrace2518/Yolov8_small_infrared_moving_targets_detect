@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import os
-import copy
+import json
 from collections.abc import Sized
+from contextlib import suppress
 from typing import Any, Optional, cast
 
 import numpy as np
@@ -109,7 +110,7 @@ class TrainingConfig:
     weight_decay: float = 0.0005
     warmup_epochs: float = 2.0
     workers: int = 0  # Windows + pagefile pressure: keep default safe
-    cache: bool = False
+    cache: bool = True
     use_amp: bool = True
     half: bool = False
     multi_scale: bool = False  # avoid random zero-size in unstable envs
@@ -481,37 +482,48 @@ class CustomTrainer:
             yaml.safe_dump(dataset_yaml, f, sort_keys=False, allow_unicode=False)
         return self.dataset_yaml_path
 
-    def _on_epoch_end_callback(self, trainer: DetectionTrainer):
-        # 仅在主进程运行 ( rank 0 或者是单卡 )
-        if getattr(trainer, 'rank', 0) not in (-1, 0):
-            return
 
-        import shutil
+    @staticmethod
+    def _assert_resume_checkpoint(checkpoint_path: Path) -> None:
+        if not checkpoint_path.exists() or not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"[Trainer] resume checkpoint not found: {checkpoint_path}. "
+                "Please pass an existing last.pt path."
+            )
 
-        weights_dir = Path(trainer.save_dir) / "weights"
-        if not weights_dir.exists():
-            return
+        if checkpoint_path.suffix.lower() != ".pt":
+            raise ValueError(f"[Trainer] resume file must be a .pt checkpoint, got: {checkpoint_path}")
 
-        self.config.models_dir.mkdir(parents=True, exist_ok=True)
-        best_pt = weights_dir / "best.pt"
-        last_pt = weights_dir / "last.pt"
-        if best_pt.exists():
-            shutil.copy2(best_pt, self.config.models_dir / "yolov8_best.pt")
-        if last_pt.exists():
-            shutil.copy2(last_pt, self.config.models_dir / "yolov8_last.pt")
+        try:
+            # PyTorch>=2.6 defaults to weights_only=True which drops optimizer/epoch state.
+            checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+        except TypeError:
+            # Compatibility fallback for older torch versions without weights_only argument.
+            checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+        except Exception as exc:
+            raise ValueError(f"[Trainer] failed to read checkpoint: {checkpoint_path} ({exc})") from exc
+
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"[Trainer] invalid checkpoint format: {checkpoint_path}")
+
+        epoch_ok = checkpoint.get("epoch") is not None
+        optimizer_ok = checkpoint.get("optimizer") is not None
+        if not (epoch_ok and optimizer_ok):
+            raise ValueError(
+                f"[Trainer] checkpoint lacks resume state (epoch/optimizer): {checkpoint_path}. "
+                "Use a true last.pt instead of best.pt for resume training."
+            )
 
     def train(self, resume_from: Optional[Path] = None) -> Any:
         resume_flag: bool = False
-        if resume_from and Path(resume_from).exists():
-            self.model = YOLO(resume_from)
+        if resume_from:
+            resume_path = Path(resume_from)
+            self._assert_resume_checkpoint(resume_path)
+            self.model = YOLO(resume_path)
             resume_flag = True
-            print(f"[Trainer] resume from: {resume_from}")
-        elif resume_from:
-            print(f"[Trainer] not found: {resume_from}")
+            print(f"[Trainer] resume from: {resume_path}")
 
         dataset_yaml = self.stage_dataset_yaml()
-
-        self.model.add_callback("on_fit_epoch_end", self._on_epoch_end_callback)
 
         if resume_flag:
             train_args = dict(

@@ -11,9 +11,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    args = parse_args()
-    from validation import model_validate
-    model_validate(args.model, args.source)
+    # args = parse_args()
+    # from validation import model_validate
+    # model_validate(args.model, args.source)
+
+    from ultralytics.utils.plotting import plot_results
+
+    # 绘制训练结果
+    plot_results(file='runs/detect/exp_20260424_165228/results.csv', dir='.')
 
 if __name__ == "__main__":
     main()

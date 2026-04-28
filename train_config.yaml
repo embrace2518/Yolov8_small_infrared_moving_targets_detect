@@ -21,15 +21,14 @@ pre_config_path: "dataset/preprocess_config.yaml"
 
 # Model
 base_model: "models/yolov8.yaml"
-pretrained: false
-pretrained_weights: "models/yolov8.pt"
+pretrained: true
+pretrained_weights: "models/yolov8n.pt"
 class_names: ["target"]
 num_classes: 1
 input_channels: 3
-replicate_gray_to_3ch_for_yolo_aug: false
 
 # Train
-epochs: 150
+epochs: 120
 batch_size: 16
 imgsz: 640
 device: "cuda"
@@ -53,8 +52,8 @@ hsv_v: 0.0
 
 # Control
 seed: 42
-patience: 10
-save_period: 10
+patience: 20
+save_period: 20
 run_name: null
 refresh_staging: true
 

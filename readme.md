@@ -32,7 +32,7 @@ class_id x_center y_center width height
 ```powershell
 python train.py --config train_config.yaml
 
-python train.py --config train_config.yaml --resume weights\yolov8_last.pt
+python train.py --config train_config.yaml --resume runs/detect/exp_20260424_165228/weights/last.pt
 ```
 
 ## 4) 推理
@@ -40,7 +40,7 @@ python train.py --config train_config.yaml --resume weights\yolov8_last.pt
 入口：`main.py`
 
 ```powershell
-python main.py --model models\yolov8.pt --source D:\Dataset\test\1 --save --conf 0.1
+python main.py --model models\yolov8.pt --source D:\Dataset\test\1
 ```
 
 预测图默认保存在 `runs/detect/predict*`。

@@ -135,13 +135,6 @@ class YOLODataset(Dataset):
         if same_dir_label.exists():
             return same_dir_label
 
-        # 次优先：labels_dir下保留相对路径。
-        rel = self._relative_to_image_root(image_path).with_suffix(".txt")
-        for label_dir in self.label_dirs:
-            candidate = label_dir / rel
-            if candidate.exists():
-                return candidate
-
         # 从JSON索引按需生成
         if self._label_json_index:
             parent_name = image_path.parent.name
@@ -204,9 +197,12 @@ class YOLODataset(Dataset):
             "tile_grid_size": cfg.clahe_tile_grid_size,
             "gamma": cfg.gamma,
         }
+        self._clahe_clip_limit = float(cfg.clahe_clip_limit)
+        self._clahe_tile_grid_size = tuple(cfg.clahe_tile_grid_size)
+        self._clahe_gamma = float(cfg.gamma)
 
         # 预先构建 LUT
-        gamma = max(float(self.clahe_params.get("gamma", 0.95)), 1e-6)
+        gamma = max(self._clahe_gamma, 1e-6)
         self._gamma_lut = np.array([np.clip(((i / 255.0) ** gamma) * 255.0, 0, 255) for i in range(256)], dtype=np.uint8)
 
     def __getstate__(self):
@@ -239,11 +235,9 @@ class YOLODataset(Dataset):
         )
         
         if getattr(self, "_clahe", None) is None:
-            # Type cast to satisfy strict dict types
-            tg_size = self.clahe_params["tile_grid_size"]
             self._clahe = cv2.createCLAHE(
-                clipLimit=float(self.clahe_params["clip_limit"]),
-                tileGridSize=tg_size if isinstance(tg_size, tuple) else (8, 8),
+                clipLimit=self._clahe_clip_limit,
+                tileGridSize=self._clahe_tile_grid_size,
             )
 
         enhanced = cv2.LUT(self._clahe.apply(denoised), self._gamma_lut)
@@ -254,8 +248,6 @@ class YOLODataset(Dataset):
             return
         seq = self.sequences[seq_idx]
         seq.image_cache[frame_idx] = image.copy()
-        if len(seq.image_cache) > 50:  # 限制单个序列的图片缓存数量
-            seq.image_cache.popitem(last=False)
 
     def _load_image(self, seq_idx: int, frame_idx: int) -> np.ndarray:
         seq = self.sequences[seq_idx]
@@ -287,8 +279,6 @@ class YOLODataset(Dataset):
             return
         seq = self.sequences[seq_idx]
         seq.label_cache[frame_idx] = labels.copy()
-        if len(seq.label_cache) > 200: # 限制标签缓存数量
-            seq.label_cache.popitem(last=False)
 
     def _load_yolo_labels(self, seq_idx: int, frame_idx: int) -> np.ndarray:
         seq = self.sequences[seq_idx]
