@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+from validation import model_validate
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="YOLOv8")
@@ -18,7 +20,7 @@ def main() -> None:
     from ultralytics.utils.plotting import plot_results
 
     # 绘制训练结果
-    plot_results(file='runs/detect/exp_20260424_165228/results.csv', dir='.')
-
+    # plot_results(file='runs/detect/exp_20260429_094305/results.csv', dir='.')
+    model_validate('runs/detect/exp_20260429_094305/weights/best.pt', 'D:/Dataset/test/1')
 if __name__ == "__main__":
     main()

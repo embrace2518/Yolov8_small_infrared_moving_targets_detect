@@ -32,7 +32,7 @@ class_id x_center y_center width height
 ```powershell
 python train.py --config train_config.yaml
 
-python train.py --config train_config.yaml --resume runs/detect/exp_20260428_200925/weights/last.pt
+python train.py --config train_config.yaml --resume runs/detect/exp_20260429_094305/weights/last.pt
 ```
 
 ## 4) 推理

@@ -57,6 +57,12 @@ save_period: 20
 run_name: null
 refresh_staging: true
 
+# 预处理对比评估
+# 开启后，训练结束时会对验证集分别评估 无预处理 / 有预处理 的图像，输出对比结果。
+# 注意：实际的预处理是否在训练中使用，取决于 dataset_config.yaml 的 enable_preprocess。
+#       这个开关只是用来做对比实验，验证预处理的效果。
+enable_preprocess_eval: true
+
 # Model artifact sync
 models_dir: "models"
 best_compare_metric: "metrics/box_map50_95"

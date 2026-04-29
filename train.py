@@ -16,9 +16,11 @@ def load_training_config(config_path: str) -> TrainingConfig:
     with Path(config_path).open("r", encoding="utf-8") as f:
         config_dict = yaml.safe_load(f) or {}
 
-    # Backward-compat alias.
+    # Backward-compat aliases.
     if "preprocess_config_path" in config_dict and "pre_config_path" not in config_dict:
         config_dict["pre_config_path"] = config_dict.pop("preprocess_config_path")
+    if "dataset_config_path" not in config_dict and "pre_config_path" in config_dict:
+        config_dict["dataset_config_path"] = config_dict["pre_config_path"]
 
     valid_keys = {f.name for f in fields(TrainingConfig)}
     filtered = {k: v for k, v in config_dict.items() if k in valid_keys}
@@ -39,12 +41,12 @@ def main() -> None:
 
     # == Run Custom Domain spotGEO Validation after default YOLOv8 Evaluation == #
     print("\n[train.py] Running ESA spotGEO custom validation on validation set...")
-    val_source = config.val_data_dir[0]  # Just picking the first val folder
+    val_sources = config.val_data_dir
     best_weights_path = trainer.output_dir / trainer.run_name / "weights" / "best.pt"
     
     if best_weights_path.exists():
         from validation import model_validate
-        model_validate(str(best_weights_path), str(val_source))
+        model_validate(str(best_weights_path), val_sources)
 
 if __name__ == "__main__":
     main()
