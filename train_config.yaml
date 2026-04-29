@@ -17,7 +17,7 @@ val_data_dir:
   - "D:/Dataset/train/12"
   - "D:/Dataset/train/13"
 output_dir: "runs/detect"
-pre_config_path: "dataset/preprocess_config.yaml"
+dataset_config_path: "dataset/dataset_config.yaml"
 
 # Model
 base_model: "models/yolov8.yaml"
@@ -33,7 +33,7 @@ batch_size: 16
 imgsz: 640
 device: "cuda"
 optimizer: "AdamW"
-learning_rate: 0.0008
+learning_rate: 0.001
 weight_decay: 0.0005
 warmup_epochs: 3.0
 workers: 4

@@ -1,0 +1,55 @@
+io:
+  image_exts: [.png, .jpg]
+
+nuc:
+  alpha: 0.02
+
+denoise:
+  method: nlm        # nlm | bilateral | median | gaussian
+  kernel: 3
+  h: 8               # NLM强度，降低避免过度平滑小目标
+
+stretch:
+  low_pct: 1.0       # 16bit -> 8bit 自适应拉伸低端百分位
+  high_pct: 99.0     # 16bit -> 8bit 自适应拉伸高端百分位
+
+clahe:
+  clip_limit: 3.0    # 对比度限制，越高增强越强
+  tile_grid_size: [4, 4]  # 4x4 tiles，更适合小目标（每格160x160）
+  gamma: 0.90
+
+gmm:
+  history: 120
+  var_threshold: 16
+  detect_shadows: false
+  learning_rate: -1.0
+
+proposal:
+  min_area: 4
+  max_area: 1600
+  max_proposals_per_frame: 10
+  binary_threshold: 200
+  morph_kernel: 3
+
+output:
+  save_masks: true
+  save_overlays: true
+  save_metadata: false
+
+synthetic:
+  enable: false
+  copies_per_frame: 1
+  blend_alpha: 0.7
+  max_shift: 12
+
+enable_preprocess: false    # 建议打开前了解影响，见下方说明
+enable_augmentation: true
+
+# 预处理 vs 数据增强的选择：
+#   enable_preprocess: true  → 每帧固定的 NUC+去噪+CLAHE+Gamma
+#   enable_preprocess: false + enable_augmentation: true
+#     → 不固定预处理，靠数据增强模拟变化（更鲁棒，推荐训练时用）
+#   建议：训练用 false+true，推理/测试时开预处理以获得稳定质量
+
+augmentation:
+  mode: medium  # light | medium | heavy

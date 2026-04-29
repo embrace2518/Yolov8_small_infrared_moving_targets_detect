@@ -22,7 +22,7 @@ from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.models.yolo.detect import DetectionTrainer
 
 from dataset.dataset import DatasetConfig, YOLODataset, yolo_collate_fn_with_indices
-from dataset.preprocess import PipelineConfig, load_config as load_preprocess_config
+from dataset.preprocess import UnifiedConfig, load_config as load_preprocess_config
 from ultralytics.utils.metrics import bbox_iou
 
 # Monkey Patch for Normalized Wasserstein Distance (NWD) Loss
@@ -89,7 +89,7 @@ class TrainingConfig:
     train_data_dir: Path | str | list[Path | str]
     val_data_dir: Path | str | list[Path | str]
     output_dir: Path
-    pre_config_path: Path
+    dataset_config_path: Path
 
     # model
     base_model: str
@@ -151,7 +151,7 @@ class TrainingConfig:
         self.val_data_dir = val_paths
 
         self.output_dir = Path(self.output_dir)
-        self.pre_config_path = Path(self.pre_config_path)
+        self.dataset_config_path = Path(self.dataset_config_path)
         self.models_dir = Path(self.models_dir)
         self.class_names = self.class_names or ["target"]
 
@@ -382,7 +382,7 @@ class CustomTrainer:
         torch.manual_seed(config.seed)
         np.random.seed(config.seed)
 
-        self.preprocess_config: PipelineConfig = load_preprocess_config(config.pre_config_path)
+        self.unified_config: UnifiedConfig = load_preprocess_config(config.dataset_config_path)
         self.train_loader, self.val_loader = self.create_dataloaders()
         self.model_source = self._resolve_model_source()
         self.model = YOLO(self.model_source)
@@ -434,7 +434,7 @@ class CustomTrainer:
             DatasetConfig(
                 images_dir=image_dirs,
                 labels_dir=image_dirs,
-                preprocess_config=self.preprocess_config,
+                unified_config=self.unified_config,
                 target_size=(self.config.imgsz, self.config.imgsz),
             ),
             mode=mode,

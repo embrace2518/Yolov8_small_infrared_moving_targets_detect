@@ -3,8 +3,8 @@ import argparse
 from dataclasses import fields
 from pathlib import Path
 import yaml
-from trainer import CustomTrainer, TrainingConfig
 from ultralytics.utils.plotting import plot_results
+from trainer import TrainingConfig, CustomTrainer
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="train the model")
