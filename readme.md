@@ -35,12 +35,19 @@ python train.py --config train_config.yaml
 python train.py --config train_config.yaml --resume runs/detect/exp_20260429_094305/weights/last.pt
 ```
 
-## 4) 推理
+## 4) 评估
 
-入口：`main.py`
 
 ```powershell
-python main.py --model models\yolov8.pt --source D:\Dataset\test\1
+python evaluate.py --weights runs/detect/exp_20260429_094305/weights/best.pt --config train_config.yaml
+
+# 自定义参数
+python evaluate.py --weights runs/detect/exp/weights/best.pt ^
+    --data D:/Dataset/val ^
+    --preprocess ^
+    --batch-size 64 ^
+    --output-dir my_eval ^
+    --max-visualize 50
 ```
 
-预测图默认保存在 `runs/detect/predict*`。
+

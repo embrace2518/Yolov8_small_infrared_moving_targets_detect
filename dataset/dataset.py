@@ -55,7 +55,7 @@ class YOLODataset(Dataset):
             aug_cfg = self.config.unified_config.augmentation_config
             aug_mode = aug_cfg.get('mode', 'medium')  # 从配置读取增强等级
             from .augmentations import get_infrared_augmentation_pipeline
-            self.augmentation = get_infrared_augmentation_pipeline(aug_mode)
+            self.augmentation = get_infrared_augmentation_pipeline(aug_mode, dataset=self)
         else:
             self.augmentation = None
         self.image_dirs = self._normalize_dirs(config.images_dir)

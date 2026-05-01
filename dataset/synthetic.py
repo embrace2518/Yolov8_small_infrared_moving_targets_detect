@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import yaml
 
+from .preprocess import read_gray_image
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
@@ -87,26 +89,6 @@ def list_sequence_dirs(root: Path) -> list[Path]:
 def list_frames(sequence_dir: Path, image_exts: tuple[str, ...]) -> list[Path]:
     frames = [p for p in sequence_dir.iterdir() if p.is_file() and p.suffix.lower() in image_exts]
     return sorted(frames, key=natural_key)
-
-
-def read_gray_image(path: Path) -> np.ndarray:
-    # Read as grayscale first to keep a stable single-channel pipeline.
-    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if image is None:
-        raise ValueError(f"Failed to read image: {path}")
-    if image.ndim == 3:
-        channels = image.shape[2]
-        if channels == 1:
-            image = image[:, :, 0]
-        elif channels == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        elif channels == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
-        else:
-            raise ValueError(f"Unsupported channel count {channels} for image: {path}")
-    if image.dtype != np.uint8:
-        image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    return image
 
 
 def suppress_background(

@@ -70,6 +70,8 @@ def patched_bbox_iou(box1, box2, xywh=False, GIoU=False, DIoU=False, CIoU=False,
     if not xywh and not CIoU:
         nwd = bbox_nwd(box1, box2, eps)
         nwd = nwd.view(iou.shape)
+        # NUMERICAL SAFETY: replace any NaN/Inf NWD with 0 so they don't corrupt EMA
+        nwd = torch.nan_to_num(nwd, nan=0.0, posinf=0.0, neginf=0.0)
         # NWD heavily compensates when standard IoU is mostly zero in tiny targets.
         return 0.5 * iou.clamp(0) + 0.5 * nwd
     return iou
@@ -109,7 +111,7 @@ class TrainingConfig:
     learning_rate: float = 0.001
     weight_decay: float = 0.0005
     warmup_epochs: float = 2.0
-    workers: int = 0  # Windows + pagefile pressure: keep default safe
+    workers: int = 4
     cache: bool = True
     use_amp: bool = True
     half: bool = False
@@ -117,7 +119,7 @@ class TrainingConfig:
 
     # aug
     augment: bool = True
-    mosaic: float = 0.0
+    mosaic: float = 0.1
     mixup: float = 0.0
     hsv_h: float = 0.015
     hsv_s: float = 0.7
@@ -125,12 +127,13 @@ class TrainingConfig:
 
     # control
     seed: int = 42
-    patience: int = 30
-    save_period: int = 10
+    patience: int = 20
+    save_period: int = 20
     run_name: Optional[str] = None
     refresh_staging: bool = True
     models_dir: Path | str = "models"
     best_compare_metric: str = "metrics/box_map50_95"
+    clip_grad: float = 1.0
 
     # ===== 预处理评估开关 =====
     # enable_preprocess_eval: 开启后，训练/验证时会额外创建一组"带预处理"的 DataLoader，
@@ -394,12 +397,9 @@ class CustomTrainer:
         self.model_source = self._resolve_model_source()
         self.model = YOLO(self.model_source)
 
-        # ===== 预处理评估模式 =====
-        # 如果启用了评估开关，额外创建一个"强制打开预处理"的验证集 DataLoader
+        # ===== 预处理对比评估 =====
+        # 已迁移至 evaluate.py，训练完成后由 _run_preprocess_comparison 统一调用。
         self.val_loader_with_preprocess = None
-        if self.config.enable_preprocess_eval:
-            self.val_loader_with_preprocess = self._create_preprocess_eval_loader()
-            print("[Trainer] 预处理评估模式已开启，验证时将同时评估 无预处理 / 有预处理 的对比结果")
 
         self.output_dir = config.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -418,46 +418,8 @@ class CustomTrainer:
         print(f"[Trainer] train images={train_size}")
         print(f"[Trainer] val images={val_size}")
 
-    def _create_preprocess_eval_loader(self) -> Optional[DataLoader]:
-        """
-        创建一个强制开启预处理的验证集 DataLoader，用于对比评估。
-        原理：复制一份 unified_config，强行将 enable_preprocess 设为 True，
-              然后用它来创建 YOLODataset。
-        """
-        import copy
-        eval_config = copy.deepcopy(self.unified_config)
-        # 强制开启预处理（不管你 dataset_config.yaml 里怎么写）
-        eval_config.enable_preprocess = True
-        # 关闭验证集的增强（保持评估的一致性）
-        eval_config.enable_augmentation = False
 
-        val_dataset = YOLODataset(
-            DatasetConfig(
-                images_dir=cast(list[Path], self.config.val_data_dir),
-                labels_dir=cast(list[Path], self.config.val_data_dir),
-                unified_config=eval_config,
-                target_size=(self.config.imgsz, self.config.imgsz),
-            ),
-            mode="val",
-        )
-        val_dataset.nc = self.config.num_classes
-        val_dataset.names = {i: name for i, name in enumerate(self.config.class_names)}
-        val_dataset.channels = self.config.effective_input_channels()
-        val_dataset.data_root = cast(list[Path], self.config.val_data_dir)[0] if self.config.val_data_dir else Path(".")
-
-        loader = DataLoader(
-            val_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            num_workers=0,  # 评估时用单线程避免序列化问题
-            pin_memory=self.device.startswith("cuda"),
-            collate_fn=yolo_collate_fn_with_indices,
-        )
-        print(f"[Trainer] 预处理评估 DataLoader 已创建 (val_size={len(val_dataset)})")
-        return loader
-
-    @staticmethod
-    def _log_runtime_env() -> None:
+    def _log_runtime_env(self) -> None:
         print(f"[Trainer] torch={torch.__version__}")
         print(f"[Trainer] cuda_available={torch.cuda.is_available()}, cuda_count={torch.cuda.device_count()}")
         if torch.cuda.is_available():
@@ -566,6 +528,27 @@ class CustomTrainer:
                 "Use a true last.pt instead of best.pt for resume training."
             )
 
+    def _sanitize_ema_before_save(self, trainer) -> None:
+        """Callback: zero-out NaN/Inf in EMA parameters before checkpoint save."""
+        ema = getattr(trainer, "ema", None)
+        if ema is None:
+            return
+        with torch.no_grad():
+            for p in ema.parameters():
+                if p.is_floating_point():
+                    mask = torch.isfinite(p)
+                    if not mask.all():
+                        p.data.masked_fill_(~mask, 0.0)
+
+    def _clip_gradients(self, trainer) -> None:
+        """Callback: gradient clipping on each optimizer step."""
+        clip_val = self.config.clip_grad
+        if clip_val > 0 and hasattr(trainer, "optimizer"):
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in trainer.model.parameters() if p.grad is not None),
+                clip_val,
+            )
+
     def train(self, resume_from: Optional[Path] = None) -> Any:
         resume_flag: bool = False
         if resume_from:
@@ -576,6 +559,13 @@ class CustomTrainer:
             print(f"[Trainer] resume from: {resume_path}")
 
         dataset_yaml = self.stage_dataset_yaml()
+
+        # Register a callback to sanitise EMA before checkpoint save
+        self.model.add_callback("on_model_save", self._sanitize_ema_before_save)
+
+        if self.config.clip_grad > 0:
+            self.model.add_callback("on_before_optimizer_step", self._clip_gradients)
+            print(f"[Trainer] 梯度裁剪已启用: max_norm={self.config.clip_grad}")
 
         if resume_flag:
             train_args = dict(
@@ -635,7 +625,7 @@ class CustomTrainer:
         self.last_train_results = self.model.train(**train_args)
 
         # ===== 预处理对比评估 =====
-        if self.config.enable_preprocess_eval and self.val_loader_with_preprocess is not None:
+        if self.config.enable_preprocess_eval:
             print("\n" + "=" * 70)
             print("[Trainer] 正在进行预处理对比评估...")
             print("=" * 70)
@@ -644,281 +634,110 @@ class CustomTrainer:
         return self.last_train_results
     def _run_preprocess_comparison(self) -> None:
         """
-        运行预处理对比评估（同时包含 YOLO mAP 和 spotGEO 竞赛指标）：
-        - 使用同一个模型分别在 无预处理 / 有预处理 的验证集上评估
-        - 输出对比结果到 runs/detect/exp_xxx/preprocess_comparison/comparison.json
+        运行预处理对比评估（合并 YOLO mAP + spotGEO 竞赛指标）。
+        使用 evaluate 模块统一评估逻辑，避免代码重复。
+        对比结果保存至 comparison.json。
         """
-        import time as time_module
-        from validation import model_validate
+        from evaluate import evaluate as run_eval
 
-        # 保存当前验证集结果路径
         comparison_dir = self.output_dir / self.run_name / "preprocess_comparison"
         comparison_dir.mkdir(parents=True, exist_ok=True)
 
-        # 临时保存目录，用于无预处理 / 有预处理各自生成 JSON 和可视化
-        raw_dir = comparison_dir / "raw"
-        pp_dir = comparison_dir / "preprocessed"
+        best_pt_path = str(self.output_dir / self.run_name / "weights" / "best.pt")
+        val_sources = self.config.val_data_dir
 
-        # ===== 1. 评估无预处理（原始数据的 baseline）=====
+        # ===== 1. 无预处理评估 (raw) =====
         print("\n" + "=" * 70)
-        print("[Preprocess Eval] 评估无预处理 (原始图像)...")
+        print("[Preprocess Eval] 无预处理 (原始图像)...")
         print("=" * 70)
-
-        # 1a. YOLO mAP 指标
-        print("  ── YOLO mAP 评估 ──")
-        setattr(torch, '_v2_validation_in_progress', True)
-        try:
-            val_args = dict(
-                plots=False, save=False,
-                val_loader=self.val_loader,
-                save_dir=str(raw_dir),
-            )
-            validator_raw = DataLoaderCompatibleValidator(
-                dataloader=self.val_loader,
-                save_dir=raw_dir, args=val_args,
-            )
-            t_start = time_module.perf_counter()
-            raw_results = validator_raw(model=self.model.model)
-            t_end = time_module.perf_counter()
-
-            raw_metrics = {}
-            if hasattr(raw_results, 'box_map50'):
-                raw_metrics['box_map50'] = float(raw_results.box_map50)
-            if hasattr(raw_results, 'box_map75'):
-                raw_metrics['box_map75'] = float(raw_results.box_map75)
-            if hasattr(raw_results, 'box_map'):
-                raw_metrics['box_map50_95'] = float(raw_results.box_map)
-
-            val_batches = len(self.val_loader)
-            raw_metrics['eval_time_s'] = t_end - t_start
-            raw_metrics['eval_fps'] = val_batches / (t_end - t_start) if (t_end - t_start) > 0 else 0
-
-            print(f"  mAP50={raw_metrics.get('box_map50', 'N/A'):.4f}, "
-                  f"mAP75={raw_metrics.get('box_map75', 'N/A'):.4f}, "
-                  f"FPS={raw_metrics['eval_fps']:.2f}")
-        finally:
-            setattr(torch, '_v2_validation_in_progress', False)
-
-        # 1b. spotGEO 竞赛指标
-        print("  ── spotGEO 竞赛评估 ──")
-        raw_spotgeo = model_validate(
-            str(self.output_dir / self.run_name / "weights" / "best.pt"),
-            self.config.val_data_dir,
+        raw_metrics = run_eval(
+            weights=best_pt_path,
+            sources=val_sources,
+            enable_preprocess=False,
+            batch_size=self.config.batch_size,
+            img_size=self.config.imgsz,
+            output_dir=str(comparison_dir),
+            run_name="raw",
+            max_visualize=5,  # 少量可视化，避免过多输出
+            no_save=False,
         )
-        if raw_spotgeo:
-            raw_metrics['spotgeo_score'] = raw_spotgeo.get('score', None)
-            raw_metrics['spotgeo_mse'] = raw_spotgeo.get('mse', None)
-            raw_metrics['spotgeo_fps'] = raw_spotgeo.get('fps', None)
-            raw_metrics['spotgeo_latency_ms'] = raw_spotgeo.get('avg_latency_ms', None)
-            print(f"  spotGEO Score(1-F1)={raw_spotgeo.get('score', 'N/A')}, "
-                  f"MSE={raw_spotgeo.get('mse', 'N/A')}, "
-                  f"FPS={raw_spotgeo.get('fps', 'N/A')}")
 
-        # ===== 2. 评估有预处理 =====
+        # ===== 2. 有预处理评估 (preprocessed) =====
         print("\n" + "=" * 70)
-        print("[Preprocess Eval] 评估有预处理 (NUC+去噪+CLAHE+Gamma)...")
+        print("[Preprocess Eval] 有预处理 (NUC+去噪+CLAHE+Gamma)...")
         print("=" * 70)
-
-        # 2a. YOLO mAP 指标
-        print("  ── YOLO mAP 评估 ──")
-        setattr(torch, '_v2_validation_in_progress', True)
-        try:
-            val_args_pp = dict(
-                plots=False, save=False,
-                val_loader=self.val_loader_with_preprocess,
-                save_dir=str(pp_dir),
-            )
-            validator_pp = DataLoaderCompatibleValidator(
-                dataloader=self.val_loader_with_preprocess,
-                save_dir=pp_dir, args=val_args_pp,
-            )
-            t_start = time_module.perf_counter()
-            pp_results = validator_pp(model=self.model.model)
-            t_end = time_module.perf_counter()
-
-            pp_metrics = {}
-            if hasattr(pp_results, 'box_map50'):
-                pp_metrics['box_map50'] = float(pp_results.box_map50)
-            if hasattr(pp_results, 'box_map75'):
-                pp_metrics['box_map75'] = float(pp_results.box_map75)
-            if hasattr(pp_results, 'box_map'):
-                pp_metrics['box_map50_95'] = float(pp_results.box_map)
-
-            pp_val_batches = len(self.val_loader_with_preprocess)
-            pp_metrics['eval_time_s'] = t_end - t_start
-            pp_metrics['eval_fps'] = pp_val_batches / (t_end - t_start) if (t_end - t_start) > 0 else 0
-
-            print(f"  mAP50={pp_metrics.get('box_map50', 'N/A'):.4f}, "
-                  f"mAP75={pp_metrics.get('box_map75', 'N/A'):.4f}, "
-                  f"FPS={pp_metrics['eval_fps']:.2f}")
-        finally:
-            setattr(torch, '_v2_validation_in_progress', False)
-
-        # 2b. spotGEO 竞赛指标
-        # 注意：有预处理时也需要传递预处理后的图像给 model_validate
-        # 我们可以直接复用 val_loader_with_preprocess 中的 images_dir
-        # 但 model_validate 是独立扫描目录的，所以需要把预处理后的图像保存到磁盘
-        # 或者我们用另一种方式：不扫描目录，直接用 batch_predict_with_timing
-        # 更简单：用 DataLoader 直接跑推理，但这里为了统一，我们直接写一个备用的 spotgeo 评估
-        print("  ── spotGEO 竞赛评估 ──")
-        # 由于有预处理的数据没有独立的磁盘目录（是内存中实时处理的），
-        # 我们直接复用 YOLO 验证的数据来运行 spotGEO 评分：
-        # 从 val_loader_with_preprocess 中拿出所有预测结果做 spotGEO 评分
-        pp_spotgeo = self._run_spotgeo_on_dataloader(
-            model=self.model.model,
-            loader=self.val_loader_with_preprocess,
-            output_dir=pp_dir,
+        pp_metrics = run_eval(
+            weights=best_pt_path,
+            sources=val_sources,
+            preprocess_config_path=self.config.dataset_config_path,
+            enable_preprocess=True,
+            batch_size=self.config.batch_size,
+            img_size=self.config.imgsz,
+            output_dir=str(comparison_dir),
+            run_name="preprocessed",
+            max_visualize=5,
+            no_save=False,
         )
-        if pp_spotgeo:
-            pp_metrics['spotgeo_score'] = pp_spotgeo.get('score', None)
-            pp_metrics['spotgeo_mse'] = pp_spotgeo.get('mse', None)
-            pp_metrics['spotgeo_fps'] = pp_spotgeo.get('fps', None)
-            pp_metrics['spotgeo_latency_ms'] = pp_spotgeo.get('avg_latency_ms', None)
-            print(f"  spotGEO Score(1-F1)={pp_spotgeo.get('score', 'N/A')}, "
-                  f"MSE={pp_spotgeo.get('mse', 'N/A')}, "
-                  f"FPS={pp_spotgeo.get('fps', 'N/A')}")
 
-        # ===== 3. 保存对比结果 =====
-        comparison = {
-            "raw (no preprocess)": raw_metrics,
-            "preprocessed": pp_metrics,
-            "diff (pp - raw)": {
-                k: pp_metrics.get(k, 0) - raw_metrics.get(k, 0)
-                for k in set(list(raw_metrics.keys()) + list(pp_metrics.keys()))
-                if isinstance(raw_metrics.get(k), (int, float)) and isinstance(pp_metrics.get(k), (int, float))
-            },
-        }
+        # ===== 3. 整理对比结果 =====
+        def _extract_key(m: dict, k: str):
+            """安全提取指标值"""
+            v = m.get(k, None)
+            if v is not None:
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    return None
+            return None
+
+        # 所有关注的指标
+        metric_keys = [
+            'fps', 'avg_latency_ms',
+            'spotgeo_score', 'spotgeo_mse',
+            'spotgeo_precision', 'spotgeo_recall', 'spotgeo_f1',
+        ]
+
+        comparison = {}
+        for key in metric_keys:
+            raw_v = _extract_key(raw_metrics, key)
+            pp_v = _extract_key(pp_metrics, key)
+            if raw_v is not None or pp_v is not None:
+                entry = {}
+                if raw_v is not None:
+                    entry["raw"] = raw_v
+                if pp_v is not None:
+                    entry["preprocessed"] = pp_v
+                if raw_v is not None and pp_v is not None:
+                    entry["diff"] = pp_v - raw_v
+                    entry["improvement_pct"] = float(f"{((pp_v - raw_v) / abs(raw_v) * 100):.2f}") if raw_v != 0 else 0.0
+                comparison[key] = entry
+
+        # 保存对比结果
         comparison_path = comparison_dir / "comparison.json"
         with comparison_path.open("w", encoding="utf-8") as f:
             json.dump(comparison, f, indent=2, ensure_ascii=False)
         print(f"\n[Preprocess Eval] 对比结果已保存: {comparison_path}")
 
-        # 打印汇总（包含所有指标）
-        print("\n" + "=" * 90)
-        print("预处理对比评估摘要:")
-        header = f"  {'指标':<25} {'无预处理':<18} {'有预处理':<18} {'差值':<12}"
+        # 打印汇总表
+        print("\n" + "=" * 95)
+        print("预处理对比评估摘要")
+        print("=" * 95)
+        header = f"  {'指标':<25} {'无预处理':<18} {'有预处理':<18} {'差值':<12} {'提升%':<10}"
         print(header)
         print("  " + "-" * 85)
-        all_metrics_keys = [
-            'box_map50', 'box_map75', 'box_map50_95',
-            'eval_fps',
-            'spotgeo_score', 'spotgeo_mse', 'spotgeo_fps',
-        ]
-        for metric in all_metrics_keys:
-            raw_v = raw_metrics.get(metric, None)
-            pp_v = pp_metrics.get(metric, None)
-            if raw_v is not None and pp_v is not None:
-                diff = pp_v - raw_v
-                sign = "+" if diff > 0 else ""
-                suffix = " fps" if "fps" in metric else ""
-                print(f"  {metric:<25} {raw_v:<18.4f} {pp_v:<18.4f} {sign}{diff:<.4f}{suffix}")
-            elif raw_v is not None:
-                print(f"  {metric:<25} {raw_v:<18.4f} {'N/A':<18}")
-            elif pp_v is not None:
-                print(f"  {metric:<25} {'N/A':<18} {pp_v:<18.4f}")
-        print("=" * 90)
+        for key in metric_keys:
+            entry = comparison.get(key)
+            if entry is None:
+                continue
+            raw_v = entry.get("raw")
+            pp_v = entry.get("preprocessed")
+            diff = entry.get("diff")
+            pct = entry.get("improvement_pct")
 
-    def _run_spotgeo_on_dataloader(
-        self,
-        model: torch.nn.Module,
-        loader: DataLoader,
-        output_dir: Path,
-    ) -> dict:
-        """
-        用 DataLoader 中的图像直接推理，然后计算 spotGEO 竞赛指标。
-        适用于内存中预处理（没有独立磁盘目录）的情况。
-        """
-        import time as time_module
-        from validation import flat_to_hierarchical, score_sequences, _to_int_or_self
-        import re
-
-        model.eval()
-        validation_data: list = []
-        inference_times = []
-        total_images = 0
-
-        with torch.no_grad():
-            for batch in loader:
-                if isinstance(batch, dict):
-                    images = batch.get("img", None)
-                else:
-                    images = batch[0] if isinstance(batch, (list, tuple)) else None
-
-                if images is None:
-                    continue
-
-                images = images.to(next(model.parameters()).device)
-                total_images += images.size(0)
-
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                t_start = time_module.perf_counter()
-                preds = model(images)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                t_end = time_module.perf_counter()
-
-                inference_times.append(t_end - t_start)
-
-                # 解析预测结果
-                for i in range(images.size(0)):
-                    # 尝试从 batch 中找到原始文件路径
-                    if isinstance(batch, dict):
-                        im_file = batch.get("im_file", [f"unknown_{i}"])[i]
-                    else:
-                        im_file = f"batch_{total_images - images.size(0) + i}"
-
-                    img_path = Path(im_file)
-                    parent_name = img_path.parent.name
-                    stem_name = img_path.stem
-
-                    seq_match = re.search(r"(\d+)", parent_name)
-                    frame_match = re.search(r"(\d+)", stem_name)
-                    sequence_id = _to_int_or_self(seq_match.group(1)) if seq_match else parent_name
-                    frame = _to_int_or_self(frame_match.group(1)) if frame_match else stem_name
-
-                    # 提取检测结果
-                    object_coords: list[list[float]] = []
-                    det = preds[i] if isinstance(preds, list) else preds
-                    if hasattr(det, 'boxes') and det.boxes is not None:
-                        for box in det.boxes.xyxy:
-                            x1, y1, x2, y2 = box.tolist()
-                            x_center = (x1 + x2) / 2.0
-                            y_center = (y1 + y2) / 2.0
-                            object_coords.append([x_center, y_center])
-
-                    validation_data.append({
-                        "sequence_id": sequence_id,
-                        "frame": frame,
-                        "num_objects": len(object_coords),
-                        "object_coords": object_coords,
-                    })
-
-        # 计算 FPS
-        total_time = sum(inference_times)
-        avg_latency_ms = (total_time / total_images * 1000) if total_images > 0 else 0.0
-        fps = 1000.0 / avg_latency_ms if avg_latency_ms > 0 else 0.0
-
-        # 保存 JSON
-        output_json_path = output_dir / "spotgeo_predictions.json"
-        output_json_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_json_path.open("w", encoding="utf-8") as f:
-            json.dump(validation_data, f, indent=4, ensure_ascii=False)
-
-        # spotGEO 评分
-        true_labels_json_path = Path("dataset/true_labels.json")
-        if true_labels_json_path.exists():
-            predictions_h = flat_to_hierarchical(validation_data)
-            with open(true_labels_json_path, 'rt') as fp:
-                labels_h = flat_to_hierarchical(json.load(fp))
-            precision, recall, F1, mse = score_sequences(predictions_h, labels_h)
-            score = 1 - F1
-
-            return {
-                "score": float(f"{score:.6f}"),
-                "mse": float(f"{mse:.6f}"),
-                "fps": float(f"{fps:.2f}"),
-                "avg_latency_ms": float(f"{avg_latency_ms:.2f}"),
-            }
-        else:
-            return {}
+            raw_str = f"{raw_v:.4f}" if raw_v is not None else "N/A"
+            pp_str = f"{pp_v:.4f}" if pp_v is not None else "N/A"
+            diff_str = f"{diff:+.4f}" if diff is not None else ""
+            pct_str = f"{pct:+.2f}%" if pct is not None else ""
+            suffix = " fps" if "fps" in key else ""
+            print(f"  {key:<25} {raw_str:<18} {pp_str:<18} {diff_str:<12} {pct_str:<10}{suffix}")
+        print("=" * 95)

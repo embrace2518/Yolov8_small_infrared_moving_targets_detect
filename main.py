@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from validation import model_validate
+from evaluate import evaluate
 
 
 def parse_args() -> argparse.Namespace:
@@ -14,13 +14,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     # args = parse_args()
-    # from validation import model_validate
-    # model_validate(args.model, args.source)
+    # evaluate(args.model, args.source)
 
-    from ultralytics.utils.plotting import plot_results
+    evaluate(
+        weights='runs/detect/exp_20260429_094305/weights/best.pt',
+        sources='D:/Dataset/test/1',
+    )
 
-    # 绘制训练结果
-    # plot_results(file='runs/detect/exp_20260429_094305/results.csv', dir='.')
-    model_validate('runs/detect/exp_20260429_094305/weights/best.pt', 'D:/Dataset/test/1')
+
 if __name__ == "__main__":
     main()

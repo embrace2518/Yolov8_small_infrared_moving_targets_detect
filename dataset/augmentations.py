@@ -391,8 +391,9 @@ class Mosaic(BaseAugmentation):
     2. 小目标被放在不同背景上下文中，学习丰富的特征
     3. 强制模型在图像的不同区域检测，减少位置偏差
     4. 自然引入尺度变化
+    5. 对小目标密集场景，增加了目标间的交互学习
     """
-    def __init__(self, p: float = 0.5, target_size: int = 640, 
+    def __init__(self, p: float = 0.5, target_size: int = 640,
                  dataset: Optional[object] = None):
         """
         Args:
@@ -405,13 +406,126 @@ class Mosaic(BaseAugmentation):
         self.dataset = dataset
 
     def apply(self, image: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """注意：此实现需要dataset支持随机索引，在Compose外会更复杂"""
+        """Mosaic增强：将当前图 + 3张随机图拼成1张"""
         if random.random() >= self.p or self.dataset is None:
             return image, labels
-        
-        # 获取3张随机图（简化版，实际需要从dataset随机抽取）
-        # 这里作为占位符，实际mosaic通常在batch层面实现
-        return image, labels
+
+        C, H, W = image.shape
+        target_h = target_w = self.target_size
+
+        # 随机选中心分裂点
+        cx = random.randint(W // 4, 3 * W // 4)
+        cy = random.randint(H // 4, 3 * H // 4)
+
+        # 收集4张图：当前图 + 3张随机图
+        ds_len = len(self.dataset)
+        images = [image]
+        all_labels = [labels]
+
+        indices = [random.randint(0, ds_len - 1) for _ in range(3)]
+        for idx in indices:
+            img_t, lbl_t, _ = self.dataset[idx]
+            # img_t: [C, H, W] tensor -> numpy
+            other_img = img_t.numpy() if hasattr(img_t, 'numpy') else np.array(img_t)
+            # labels可能为 None
+            other_lbl = lbl_t.numpy() if hasattr(lbl_t, 'numpy') and len(lbl_t) > 0 else np.zeros((0, 5), dtype=np.float32)
+            images.append(other_img)
+            all_labels.append(other_lbl)
+
+        # 拼成4象限
+        # 图像顺序: 左上=0, 右上=1, 左下=2, 右下=3
+        out_img = np.zeros((C, target_h, target_w), dtype=np.uint8)
+        out_labels = []
+
+        quad_info = [
+            # (img_idx, src_crop, dst_region, h_scale, w_scale, h_off, w_off)
+            # 左上: 图片0 取 [0:cy, 0:cx] -> [0:cy_out, 0:cx_out]
+            (0, (0, cy, 0, cx), (0, 0)),
+            # 右上: 图片1 取 [0:cy, cx:W] -> [0:cy_out, cx_out:target_w]
+            (1, (0, cy, cx, W), (0, cx)),
+            # 左下: 图片2 取 [cy:H, 0:cx] -> [cy_out:target_h, 0:cx_out]
+            (2, (cy, H, 0, cx), (cy, 0)),
+            # 右下: 图片3 取 [cy:H, cx:W] -> [cy_out:target_h, cx_out:target_w]
+            (3, (cy, H, cx, W), (cy, cx)),
+        ]
+
+        def _resize_crop(src_img, y1, y2, x1, x2, out_h, out_w):
+            """裁剪并缩放到目标大小"""
+            crop = src_img[:, y1:y2, x1:x2]  # [C, h, w]
+            if crop.shape[1] == 0 or crop.shape[2] == 0:
+                return None
+            return np.stack([cv2.resize(crop[c], (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                             for c in range(C)], axis=0)
+
+        for img_idx, (y1, y2, x1, x2), (dst_y, dst_x) in quad_info:
+            src = images[img_idx]
+            src_h, src_w = src.shape[1], src.shape[2]
+            # 裁剪区域
+            c_y1 = max(0, y1)
+            c_y2 = min(src_h, y2)
+            c_x1 = max(0, x1)
+            c_x2 = min(src_w, x2)
+
+            crop_h = c_y2 - c_y1
+            crop_w = c_x2 - c_x1
+            if crop_h <= 0 or crop_w <= 0:
+                continue
+
+            # 目标区域大小
+            dst_h = target_h // 2
+            dst_w = target_w // 2
+            if img_idx > 1:
+                dst_h = target_h - cy
+            if img_idx % 2 == 1:
+                dst_w = target_w - cx
+
+            resized = _resize_crop(src, c_y1, c_y2, c_x1, c_x2, dst_h, dst_w)
+            if resized is not None:
+                out_img[:, dst_y:dst_y+dst_h, dst_x:dst_x+dst_w] = resized
+
+            # 转换标签
+            lbl = all_labels[img_idx]
+            if len(lbl) > 0:
+                for row in lbl:
+                    cls_id = int(row[0])
+                    xc, yc, bw, bh = row[1:5]
+                    # 原图归一化坐标 -> 绝对坐标
+                    abs_x = xc * src_w
+                    abs_y = yc * src_h
+                    abs_w = bw * src_w
+                    abs_h = bh * src_h
+
+                    # 检查是否在裁剪区域内
+                    x1_a = abs_x - abs_w / 2
+                    y1_a = abs_y - abs_h / 2
+                    x2_a = abs_x + abs_w / 2
+                    y2_a = abs_y + abs_h / 2
+
+                    # 裁剪到裁剪区域
+                    x1_c = max(x1_a, c_x1)
+                    y1_c = max(y1_a, c_y1)
+                    x2_c = min(x2_a, c_x2)
+                    y2_c = min(y2_a, c_y2)
+
+                    if x2_c - x1_c <= 1 or y2_c - y1_c <= 1:
+                        continue  # 裁剪后太小，丢弃
+
+                    # 映射到目标区域
+                    new_x1 = (x1_c - c_x1) / crop_w * dst_w + dst_x
+                    new_y1 = (y1_c - c_y1) / crop_h * dst_h + dst_y
+                    new_x2 = (x2_c - c_x1) / crop_w * dst_w + dst_x
+                    new_y2 = (y2_c - c_y1) / crop_h * dst_h + dst_y
+
+                    # 归一化到输出图像
+                    out_xc = (new_x1 + new_x2) / 2 / target_w
+                    out_yc = (new_y1 + new_y2) / 2 / target_h
+                    out_bw = (new_x2 - new_x1) / target_w
+                    out_bh = (new_y2 - new_y1) / target_h
+
+                    if out_bw > 0.003 and out_bh > 0.003:
+                        out_labels.append([cls_id, out_xc, out_yc, out_bw, out_bh])
+
+        return out_img, np.array(out_labels, dtype=np.float32) if out_labels else np.zeros((0, 5), dtype=np.float32)
 
 
 class Cutout(BaseAugmentation):
@@ -504,6 +618,7 @@ def get_infrared_augmentation_pipeline(mode: str = 'medium', dataset=None) -> Co
 
     Args:
         mode: 'light' | 'medium' | 'heavy'
+        dataset: 数据集引用（Mosaic 增强需要）
         
     Returns:
         ComposeAugmentations 实例
@@ -528,6 +643,7 @@ def get_infrared_augmentation_pipeline(mode: str = 'medium', dataset=None) -> Co
         return ComposeAugmentations([
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.3),
+            Mosaic(p=0.3, target_size=640, dataset=dataset),
             RandomRotate90(p=0.3),
             RandomScale(scale_range=(0.7, 1.3), p=0.3),
             RandomBrightnessContrast(p=0.8, brightness_delta=0.4, contrast_delta=0.4),

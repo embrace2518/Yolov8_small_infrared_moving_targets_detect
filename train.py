@@ -45,8 +45,8 @@ def main() -> None:
     best_weights_path = trainer.output_dir / trainer.run_name / "weights" / "best.pt"
     
     if best_weights_path.exists():
-        from validation import model_validate
-        model_validate(str(best_weights_path), val_sources)
+        from evaluate import evaluate
+        evaluate(weights=str(best_weights_path), sources=val_sources, no_save=True)
 
 if __name__ == "__main__":
     main()
