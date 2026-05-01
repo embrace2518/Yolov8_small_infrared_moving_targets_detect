@@ -162,7 +162,7 @@ def _print_seq_stats(validation_data: list) -> None:
     total_frames_with_det = 0
     total_detections = 0
     for seq in seq_stats:
-        logger.info("  %-12s %-10s %-10s %-10.2%% %-10s",
+        logger.info("  %-12s %-10s %-10s %-10.2f%% %-10s",
                     seq['sequence_id'], seq['total_frames'],
                     seq['frames_with_detections'],
                     seq['detection_rate'] * 100, seq['total_detections'])
