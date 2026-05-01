@@ -36,12 +36,6 @@ output:
   save_overlays: true
   save_metadata: false
 
-synthetic:
-  enable: false
-  copies_per_frame: 1
-  blend_alpha: 0.7
-  max_shift: 12
-
 enable_preprocess: false    # 建议打开前了解影响，见下方说明
 enable_augmentation: true
 

@@ -10,6 +10,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from .preprocess import ImagePreprocessor, ImageReadError, UnifiedConfig, SceneBasedNUC, read_gray_image
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -43,19 +46,20 @@ class SequenceData:
     nuc: SceneBasedNUC | None = None
     last_processed_frame: int = -1
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.frame_paths)
 
 
 class YOLODataset(Dataset):
-    def __init__(self, config: DatasetConfig, mode: str):
+    def __init__(self, config: DatasetConfig, mode: str, copy_paste_prob: float = 0.3) -> None:
         self.config = config
         self.mode = mode
         if self.mode == "train" and self.config.unified_config.enable_augmentation:
             aug_cfg = self.config.unified_config.augmentation_config
             aug_mode = aug_cfg.get('mode', 'medium')  # 从配置读取增强等级
             from .augmentations import get_infrared_augmentation_pipeline
-            self.augmentation = get_infrared_augmentation_pipeline(aug_mode, dataset=self)
+            self.augmentation = get_infrared_augmentation_pipeline(aug_mode, dataset=self,
+                                                                    copy_paste_prob=copy_paste_prob)
         else:
             self.augmentation = None
         self.image_dirs = self._normalize_dirs(config.images_dir)
@@ -84,8 +88,8 @@ class YOLODataset(Dataset):
             return [Path(path_like)]
         return [Path(p) for p in path_like]
 
-    @staticmethod
-    def _image_sort_key(path: Path) -> tuple[str, int, str]:
+    def _image_sort_key(self, path: Path) -> tuple[str, int, str]:
+        # Precompute sort key: (parent_dir, last_number, stem)
         stem = path.stem
         numbers = list(map(int, re.findall(r'\d+', stem)))
         primary_num = numbers[-1] if numbers else -1
@@ -93,12 +97,14 @@ class YOLODataset(Dataset):
 
     def _load_image_files(self) -> list[Path]:
         image_exts = self.config.unified_config.preprocess_config.image_exts
-        image_files: list[Path] = []
+        image_exts_lower = {ext.lower() for ext in image_exts}
+        # Single pass: collect all files, filter by extension
+        all_files: list[Path] = []
         for img_dir in self.image_dirs:
-            for ext in image_exts:
-                image_files.extend(img_dir.rglob(f"*{ext}"))
-                image_files.extend(img_dir.rglob(f"*{ext.upper()}"))
-        return sorted(image_files, key=self._image_sort_key)
+            for entry in img_dir.rglob("*"):
+                if entry.is_file() and entry.suffix.lower() in image_exts_lower:
+                    all_files.append(entry)
+        return sorted(all_files, key=self._image_sort_key)
 
     def _load_sequences(self) -> list[SequenceData]:
         grouped: dict[str, list[Path]] = {}
@@ -161,9 +167,9 @@ class YOLODataset(Dataset):
         except ImageReadError as e:
             self._read_fail_count += 1
             if self._read_fail_count <= self._read_fail_log_limit:
-                print(f"[Dataset] read failed, use placeholder: {e}")
+                logger.warning("read failed, use placeholder: %s", e)
                 if self._read_fail_count == self._read_fail_log_limit:
-                    print("[Dataset] too many read errors, suppressing further logs...")
+                    logger.warning("too many read errors, suppressing further logs...")
 
             # Fallback keeps training running when single files are corrupted/unreadable.
             target_h, target_w = self.target_size
@@ -231,22 +237,22 @@ class YOLODataset(Dataset):
         channels = int(getattr(self, "channels", 1))
 
         if channels == 3:
-            seq_idx, frame_idx = self.samples[idx]
             seq_len = len(self.sequences[seq_idx])
 
-            # 获取前后帧 (边界处理：超出边界则拿当前帧补)
+            # Get previous and next frames (boundary: clamp to edges)
             prev_frame_idx = max(0, frame_idx - 1)
             next_frame_idx = min(seq_len - 1, frame_idx + 1)
 
-            image_prev = self._load_image(seq_idx, prev_frame_idx)
-            image_next = self._load_image(seq_idx, next_frame_idx)
+            # Only load adjacent frames — current frame image is already loaded above
+            image_prev = self._load_image(seq_idx, prev_frame_idx) if prev_frame_idx != frame_idx else image
+            image_next = self._load_image(seq_idx, next_frame_idx) if next_frame_idx != frame_idx else image
 
-            # 缩放
+            # Resize
             image = self._resize_image(image)
             image_prev = self._resize_image(image_prev)
             image_next = self._resize_image(image_next)
 
-            # 堆叠成 HWC -> CHW，Shape: 3 x H x W
+            # Stack into CHW: 3 x H x W
             stacked = np.stack([image_prev, image, image_next], axis=0)
         else:
             image = self._resize_image(image)

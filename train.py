@@ -5,6 +5,9 @@ from pathlib import Path
 import yaml
 from ultralytics.utils.plotting import plot_results
 from trainer import TrainingConfig, CustomTrainer
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="train the model")
@@ -26,7 +29,7 @@ def load_training_config(config_path: str) -> TrainingConfig:
     filtered = {k: v for k, v in config_dict.items() if k in valid_keys}
     ignored = sorted(k for k in config_dict.keys() if k not in valid_keys)
     if ignored:
-        print(f"[train.py] ignore unsupported config keys: {', '.join(ignored)}")
+        logger.warning("ignore unsupported config keys: %s", ", ".join(ignored))
 
     return TrainingConfig(**filtered)
 
@@ -40,7 +43,7 @@ def main() -> None:
     plot_results(csv_path, trainer.output_dir / trainer.run_name)
 
     # == Run Custom Domain spotGEO Validation after default YOLOv8 Evaluation == #
-    print("\n[train.py] Running ESA spotGEO custom validation on validation set...")
+    logger.info("Running ESA spotGEO custom validation on validation set...")
     val_sources = config.val_data_dir
     best_weights_path = trainer.output_dir / trainer.run_name / "weights" / "best.pt"
     

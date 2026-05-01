@@ -16,7 +16,20 @@ import cv2
 
 class BaseAugmentation:
     """基础数据增强基类"""
-    def apply(self, image: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+
+    @staticmethod
+    def _to_hwc(image: np.ndarray) -> np.ndarray:
+        """[C, H, W] → [H, W, C]"""
+        return np.transpose(image, (1, 2, 0))
+
+    @staticmethod
+    def _to_chw(image: np.ndarray) -> np.ndarray:
+        """[H, W] or [H, W, C] → [C, H, W]"""
+        if image.ndim == 2:
+            return image[np.newaxis, :, :]
+        return np.transpose(image, (2, 0, 1))
+
+    def apply(self, image: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
         Args:
             image: [C, H, W] numpy array (uint8)
@@ -190,38 +203,31 @@ class RandomBlur(BaseAugmentation):
         self.blur_type = blur_type
         self.p = p
 
-    def apply(self, image: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def apply(self, image: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if random.random() < self.p:
             k = random.choice([3, 5]) if self.max_kernel >= 5 else 3
-            # 转成 [H, W] 或 [H, W, C] 给 cv2
-            img = np.transpose(image, (1, 2, 0))  # [H, W, C]
-            
+            C = image.shape[0]
+
             if self.blur_type == 'gaussian':
                 sigma = random.uniform(0.5, 2.0)
-                img = cv2.GaussianBlur(img, (k, k), sigma)
+                for c in range(C):
+                    image[c] = cv2.GaussianBlur(image[c], (k, k), sigma)
             elif self.blur_type == 'average':
-                img = cv2.blur(img, (k, k))
+                for c in range(C):
+                    image[c] = cv2.blur(image[c], (k, k))
             elif self.blur_type == 'motion':
-                # 运动模糊核
                 size = random.choice([3, 5, 7])
                 angle = random.uniform(0, 180)
                 kernel_motion = np.zeros((size, size))
                 kernel_motion[int((size-1)/2), :] = 1
                 kernel_motion = cv2.warpAffine(
-                    kernel_motion, 
+                    kernel_motion,
                     cv2.getRotationMatrix2D((size/2-0.5, size/2-0.5), angle, 1.0),
                     (size, size)
                 )
                 kernel_motion /= kernel_motion.sum()
-                img = cv2.filter2D(img, -1, kernel_motion)
-            
-            # 灰度图输入，转回 [C, H, W]
-            if img.ndim == 3 and img.shape[2] == 1:
-                image = np.transpose(img, (2, 0, 1))
-            elif img.ndim == 3:
-                image = np.transpose(img, (2, 0, 1))
-            else:
-                image = img[np.newaxis, :, :]
+                for c in range(C):
+                    image[c] = cv2.filter2D(image[c], -1, kernel_motion)
         return image, labels
 
 
@@ -237,79 +243,60 @@ class RandomScale(BaseAugmentation):
         self.scale_range = scale_range
         self.p = p
 
-    def apply(self, image: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def apply(self, image: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if random.random() < self.p:
             h_img, w_img = image.shape[1], image.shape[2]
             scale = random.uniform(*self.scale_range)
             new_w, new_h = int(w_img * scale), int(h_img * scale)
-            
-            # 防止缩得太小
+
             new_w = max(new_w, 32)
             new_h = max(new_h, 32)
-            
-            # 缩放图像
-            img = np.transpose(image, (1, 2, 0))  # [H, W, C]
-            if img.shape[2] == 1:
-                img = img[:, :, 0]
-            
-            # 对小目标用 INTER_AREA (下采样) 或 INTER_LINEAR (上采样)
+
+            # Scale each channel independently (avoids CHW↔HWC transpose)
+            C = image.shape[0]
             interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-            resized = cv2.resize(img, (new_w, new_h), interpolation=interp)
-            
-            if resized.ndim == 2:
-                resized = resized[:, :, np.newaxis]
-            image = np.transpose(resized, (2, 0, 1)).astype(np.uint8)
-            
-            # 缩放标签
-            if len(labels) > 0:
-                labels[:, 1:5] = labels[:, 1:5]  # 坐标不变，会由后续resize统一处理
-            
+            resized = np.empty((C, new_h, new_w), dtype=np.uint8)
+            for c in range(C):
+                resized[c] = cv2.resize(image[c], (new_w, new_h), interpolation=interp)
+
+            image = resized
             # 缩放到目标尺寸（letterbox）
             image, labels = self._letterbox(image, labels, (h_img, w_img))
         return image, labels
 
-    def _letterbox(self, image: np.ndarray, labels: np.ndarray, 
-                   target_size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
-        """保持宽高比的缩放填充"""
-        h, w = image.shape[1], image.shape[2]
+    def _letterbox(self, image: np.ndarray, labels: np.ndarray,
+                   target_size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+        """保持宽高比的缩放填充（逐通道处理，无 transpose）"""
+        C, h, w = image.shape
         target_h, target_w = target_size
-        
+
         scale = min(target_w / w, target_h / h)
         new_w, new_h = int(w * scale), int(h * scale)
-        
-        # 填充到目标尺寸
+
+        # Resize each channel independently
+        resized = np.empty((C, new_h, new_w), dtype=np.uint8)
+        for c in range(C):
+            resized[c] = cv2.resize(image[c], (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
         dw = (target_w - new_w) / 2
         dh = (target_h - new_h) / 2
-        
-        # resize
-        img = np.transpose(image, (1, 2, 0))
-        if img.shape[2] == 1:
-            img = img[:, :, 0]
-        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        if resized.ndim == 2:
-            resized = resized[:, :, np.newaxis]
-        
-        # 填充
         top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
         left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-        resized = cv2.copyMakeBorder(resized, top, bottom, left, right, 
-                                     cv2.BORDER_CONSTANT, value=0)
-        
-        image = np.transpose(resized, (2, 0, 1)).astype(np.uint8)
-        
-        # 调整标签
+
+        # Pad with zeros (slice assignment, no copyMakeBorder needed)
+        image = np.zeros((C, target_h, target_w), dtype=np.uint8)
+        image[:, top:top + new_h, left:left + new_w] = resized
+
         if len(labels) > 0:
             labels[:, 1] = (labels[:, 1] * w * scale + dw) / target_w
             labels[:, 2] = (labels[:, 2] * h * scale + dh) / target_h
             labels[:, 3] = labels[:, 3] * scale * w / target_w
             labels[:, 4] = labels[:, 4] * scale * h / target_h
-            
-            # 裁剪到 [0, 1]
+
             labels[:, 1:] = np.clip(labels[:, 1:], 0.0, 1.0)
-            # 过滤无效框
             valid = (labels[:, 3] > 0.001) & (labels[:, 4] > 0.001)
             labels = labels[valid]
-        
+
         return image, labels
 
 
@@ -335,16 +322,11 @@ class RandomTranslate(BaseAugmentation):
             ty = random.uniform(-self.max_translate, self.max_translate) * h
             
             M = np.float32([[1, 0, tx], [0, 1, ty]])
-            
-            # 平移图像
-            img = np.transpose(image, (1, 2, 0))
-            channels = []
-            for c in range(img.shape[2]):
-                channel = cv2.warpAffine(img[:, :, c], M, (w, h), 
-                                         borderMode=cv2.BORDER_REFLECT)
-                channels.append(channel)
-            img = np.stack(channels, axis=-1)
-            image = np.transpose(img, (2, 0, 1)).astype(np.uint8)
+
+            # 平移图像（逐通道处理，避免 CHW→HWC→CHW 转换）
+            for c in range(image.shape[0]):
+                image[c] = cv2.warpAffine(image[c], M, (w, h),
+                                          borderMode=cv2.BORDER_REFLECT)
             
             # 平移标签
             if len(labels) > 0:
@@ -554,6 +536,177 @@ class Cutout(BaseAugmentation):
         return image, labels
 
 
+class CopyPaste(BaseAugmentation):
+    """
+    Copy-Paste 增强 — 裁剪目标块并粘贴到另一图像位置
+
+    对红外小目标特别有效：
+    1. 缓解小目标正样本稀疏问题
+    2. 目标被放在不同背景上下文中，学习丰富的特征
+    3. 基于局部灰度统计匹配粘贴位置，保证物理合理性
+
+    实现：
+    - 从训练集中随机取另一张图（通过 dataset 引用）
+    - 提取全部目标块（边界框 + 边缘扩展）
+    - 在目标图像上搜索灰度近似的粘贴位置
+    - Alpha 融合边界过渡
+    """
+    def __init__(self, p: float = 0.3, dataset=None, margin_ratio: float = 0.15,
+                 search_samples: int = 20, alpha: float = 0.85):
+        """
+        Args:
+            p: 应用概率
+            dataset: 数据集引用，用于获取随机样本
+            margin_ratio: 裁剪时在标注框外扩展的比例（相对短边）
+            search_samples: 搜索粘贴位置的采样点数量
+            alpha: Alpha 融合系数（0=完全透明, 1=完全不透明）
+        """
+        self.p = p
+        self.dataset = dataset
+        self.margin_ratio = margin_ratio
+        self.search_samples = search_samples
+        self.alpha = alpha
+
+    def _extract_patches(self, image: np.ndarray, labels: np.ndarray
+                         ) -> list[tuple[np.ndarray, np.ndarray, float, float]]:
+        """
+        从图像中裁剪所有目标块。
+        Returns: [(patch_img, label_xywh, gray_mean, gray_std), ...]
+        其中 label_xywh = [cls_id, x_center, y_center, width, height]
+        """
+        patches = []
+        h, w = image.shape[1], image.shape[2]  # [C, H, W]
+        for label in labels:
+            cls_id, xc, yc, bw, bh = label
+            # 反归一化
+            cx, cy = int(xc * w), int(yc * h)
+            bw_px, bh_px = int(bw * w), int(bh * h)
+            if bw_px < 3 or bh_px < 3:
+                continue
+            margin = max(1, int(min(bw_px, bh_px) * self.margin_ratio))
+            x1 = max(0, cx - bw_px // 2 - margin)
+            y1 = max(0, cy - bh_px // 2 - margin)
+            x2 = min(w, cx + bw_px // 2 + margin)
+            y2 = min(h, cy + bh_px // 2 + margin)
+            patch = image[:, y1:y2, x1:x2].copy()
+            # 计算局部灰度统计（取中心区域）
+            center_region = image[0, max(0, cy-3):min(h, cy+3),
+                                  max(0, cx-3):min(w, cx+3)]
+            gray_mean = float(np.mean(center_region))
+            gray_std = float(np.std(center_region)) + 1e-6
+            patches.append((patch, label, gray_mean, gray_std))
+        return patches
+
+    def _find_best_location(self, image: np.ndarray, patch: np.ndarray,
+                             target_gray_mean: float, target_gray_std: float
+                             ) -> Optional[tuple[int, int, int, int]]:
+        """
+        在图像中搜索灰度近似的位置。
+        Returns: (x1, y1, x2, y2) 粘贴位置
+        """
+        h_img, w_img = image.shape[1], image.shape[2]
+        ph, pw = patch.shape[1], patch.shape[2]
+        best_score = float('inf')
+        best_bbox = None
+        for _ in range(self.search_samples):
+            x = random.randint(0, max(1, w_img - pw))
+            y = random.randint(0, max(1, h_img - ph))
+            region = image[0, y:min(h_img, y+ph), x:min(w_img, x+pw)]
+            if region.size < 4:
+                continue
+            region_mean = float(np.mean(region))
+            region_std = float(np.std(region)) + 1e-6
+            # 灰度统计匹配得分
+            mean_diff = abs(region_mean - target_gray_mean) / target_gray_std
+            std_ratio = region_std / target_gray_std
+            score = mean_diff + abs(1.0 - std_ratio)
+            if score < best_score:
+                best_score = score
+                best_bbox = (x, y, x + pw, y + ph)
+        return best_bbox
+
+    def apply(self, image: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if random.random() >= self.p or self.dataset is None or len(labels) == 0:
+            return image, labels
+
+        h, w = image.shape[1], image.shape[2]
+        # 从数据集中随机取另一张图
+        ds_len = len(self.dataset)
+        src_idx = random.randint(0, ds_len - 1)
+        src_img, src_labels, _ = self.dataset[src_idx]
+        # dataset 返回的可能是 [C,H,W] 或 [H,W,C]；统一为 [C,H,W] uint8
+        if src_img.ndim == 2:
+            src_img = np.expand_dims(src_img, axis=0)
+        elif src_img.ndim == 3 and src_img.shape[-1] in (1, 3):
+            src_img = np.transpose(src_img, (2, 0, 1))
+        src_img = src_img.astype(np.uint8)
+
+        if not isinstance(src_labels, np.ndarray) or len(src_labels) == 0:
+            return image, labels
+
+        # 提取源图的目标块
+        patches = self._extract_patches(src_img, src_labels)
+        if not patches:
+            return image, labels
+
+        new_labels = labels.tolist() if isinstance(labels, np.ndarray) else labels.copy()
+        out_img = image.copy()
+
+        for patch, src_label, gray_mean, gray_std in patches:
+            ph, pw = patch.shape[1], patch.shape[2]
+            if ph < 4 or pw < 4:
+                continue
+            loc = self._find_best_location(out_img, patch, gray_mean, gray_std)
+            if loc is None:
+                continue
+            x1, y1, x2, y2 = loc
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+
+            # Alpha 融合
+            if self.alpha < 1.0:
+                out_img[:, y1:y2, x1:x2] = (out_img[:, y1:y2, x1:x2] * (1 - self.alpha) +
+                                             patch * self.alpha).astype(np.uint8)
+            else:
+                out_img[:, y1:y2, x1:x2] = patch
+
+            # 边缘 2px 软化（与原始背景融合）
+            if ph > 4 and pw > 4:
+                # Store original background for proper blending
+                bg_original = image.copy()
+
+                for c in range(out_img.shape[0]):
+                    for dx in range(min(2, pw)):
+                        fade = (dx + 1) / 3.0
+                        out_img[c, y1:y2, x1+dx] = (
+                            bg_original[c, y1:y2, x1+dx] * (1 - fade) +
+                            out_img[c, y1:y2, x1+dx] * fade
+                        ).astype(np.uint8)
+                        out_img[c, y1:y2, x2-dx-1] = (
+                            bg_original[c, y1:y2, x2-dx-1] * (1 - fade) +
+                            out_img[c, y1:y2, x2-dx-1] * fade
+                        ).astype(np.uint8)
+                    # 垂直边缘淡化
+                    for dy in range(min(2, ph)):
+                        fade = (dy + 1) / 3.0
+                        out_img[c, y1+dy, x1:x2] = (bg_original[c, y1+dy, x1:x2] * (1 - fade) +
+                                                     out_img[c, y1+dy, x1:x2] * fade).astype(np.uint8)
+                        out_img[c, y2-dy-1, x1:x2] = (bg_original[c, y2-dy-1, x1:x2] * (1 - fade) +
+                                                       out_img[c, y2-dy-1, x1:x2] * fade).astype(np.uint8)
+
+            # 计算粘贴后新的归一化坐标
+            paste_cx = ((x1 + x2) / 2) / w
+            paste_cy = ((y1 + y2) / 2) / h
+            paste_bw = (x2 - x1) / w
+            paste_bh = (y2 - y1) / h
+
+            # 过滤：太小或越界的不加
+            if paste_bw > 0.005 and paste_bh > 0.005 and paste_cx > 0 and paste_cy > 0:
+                new_labels.append([src_label[0], paste_cx, paste_cy, paste_bw, paste_bh])
+
+        return out_img, np.array(new_labels, dtype=np.float32) if new_labels else np.zeros((0, 5), dtype=np.float32)
+
+
 class ComposeAugmentations:
     """
     组合多个数据增强 - 专为时序堆叠优化
@@ -575,7 +728,7 @@ class ComposeAugmentations:
     """
 
     _GEOMETRIC_OPS = ('randomhorizontalflip', 'randomverticalflip', 'randomrotate90',
-                       'randomscale', 'randomtranslate')
+                       'randomscale', 'randomtranslate', 'copypaste', 'mosaic')
     _PHOTOMETRIC_OPS = ('randombrightnesscontrast', 'randomnoise', 'randomblur', 'cutout')
 
     def __init__(self, augmentations: List[BaseAugmentation]):
@@ -612,13 +765,15 @@ class ComposeAugmentations:
 # 推荐的增强组合
 # ====================
 
-def get_infrared_augmentation_pipeline(mode: str = 'medium', dataset=None) -> ComposeAugmentations:
+def get_infrared_augmentation_pipeline(mode: str = 'medium', dataset=None,
+                                        copy_paste_prob: float = 0.3) -> ComposeAugmentations:
     """
     返回针对红外图像优化的增强管道
 
     Args:
         mode: 'light' | 'medium' | 'heavy'
-        dataset: 数据集引用（Mosaic 增强需要）
+        dataset: 数据集引用（Mosaic/CopyPaste 需要随机采样）
+        copy_paste_prob: Copy-Paste 增强概率（0=关闭）
         
     Returns:
         ComposeAugmentations 实例
@@ -640,9 +795,13 @@ def get_infrared_augmentation_pipeline(mode: str = 'medium', dataset=None) -> Co
         ])
     
     else:  # 'heavy'
-        return ComposeAugmentations([
+        aug_list = [
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.3),
+        ]
+        if copy_paste_prob > 0 and dataset is not None:
+            aug_list.append(CopyPaste(p=copy_paste_prob, dataset=dataset))
+        aug_list.extend([
             Mosaic(p=0.3, target_size=640, dataset=dataset),
             RandomRotate90(p=0.3),
             RandomScale(scale_range=(0.7, 1.3), p=0.3),
@@ -652,3 +811,4 @@ def get_infrared_augmentation_pipeline(mode: str = 'medium', dataset=None) -> Co
             RandomTranslate(max_translate=0.1, p=0.3),
             Cutout(max_holes=1, max_size=0.08, p=0.2),
         ])
+        return ComposeAugmentations(aug_list)

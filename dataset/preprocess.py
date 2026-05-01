@@ -259,7 +259,7 @@ class ImagePreprocessor:
             int(self.denoise_params["h"]),
         )
 
-        corrected = seq_nuc.apply(denoised)
+        corrected = seq_nuc.apply(denoised) if seq_nuc is not None else denoised
 
         if self._clahe is None:
             self._clahe = cv2.createCLAHE(

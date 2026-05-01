@@ -49,35 +49,29 @@ from validation import (
     _resolve_sources,
 )
 
+from utils.logging import get_logger
+from utils.args import add_common_eval_args
+
+logger = get_logger(__name__)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="独立评估接口：YOLO mAP + spotGEO + FPS")
-    
-    parser.add_argument("--weights", type=str, default=None,
-                        help="模型权重路径，如 runs/detect/exp_xxx/weights/best.pt")
+
+    add_common_eval_args(parser)
     parser.add_argument("--data", type=str, nargs="+", default=None,
                         help="评估数据目录，支持多个目录")
     parser.add_argument("--config", type=str, default=None,
                         help="训练配置文件（从配置中读取 weights 和 data）")
-    parser.add_argument("--preprocess", action="store_true",
-                        help="启用预处理（如 NUC+去噪+CLAHE+Gamma）")
     parser.add_argument("--preprocess-config", type=str, default="dataset/dataset_config.yaml",
                         help="预处理配置文件路径")
-    parser.add_argument("--batch-size", type=int, default=32,
-                        help="推理批量大小（默认 32）")
-    parser.add_argument("--img-size", type=int, default=640,
-                        help="图像输入尺寸（默认 640）")
-    parser.add_argument("--output-dir", type=str, default="runs/evaluate",
-                        help="结果输出目录（默认 runs/evaluate）")
     parser.add_argument("--max-visualize", type=int, default=20,
                         help="最大可视化图像数（默认 20）")
-    parser.add_argument("--conf", type=float, default=0.1,
-                        help="检测置信度阈值（默认 0.1）")
     parser.add_argument("--name", type=str, default=None,
                         help="实验名称（默认自动生成）")
     parser.add_argument("--true-labels", type=str, default="dataset/true_labels.json",
                         help="真实标签 JSON 路径（默认 dataset/true_labels.json）")
-    
+
     return parser.parse_args()
 
 
@@ -119,13 +113,13 @@ def _compute_fps_metrics(inference_times: list[float], total_images: int, batch_
 
 
 def _print_fps(fps_metrics: dict) -> None:
-    print(f"\n========== FPS 性能指标 ==========")
-    print(f"  总图像数      : {fps_metrics['total_images']}")
-    print(f"  批量大小      : {fps_metrics['batch_size']}")
-    print(f"  总推理时间    : {fps_metrics['total_inference_time_s']:.3f} s")
-    print(f"  平均延迟/张   : {fps_metrics['avg_latency_ms']} ms")
-    print(f"  平均 FPS      : {fps_metrics['fps']}")
-    print(f"===================================\n")
+    logger.info("========== FPS 性能指标 ==========")
+    logger.info("  总图像数      : %s", fps_metrics['total_images'])
+    logger.info("  批量大小      : %s", fps_metrics['batch_size'])
+    logger.info("  总推理时间    : %.3f s", fps_metrics['total_inference_time_s'])
+    logger.info("  平均延迟/张   : %s ms", fps_metrics['avg_latency_ms'])
+    logger.info("  平均 FPS      : %s", fps_metrics['fps'])
+    logger.info("===================================")
 
 
 def _compute_spotgeo_score(validation_data: list, true_labels_path: str | Path = "dataset/true_labels.json") -> dict:
@@ -149,33 +143,34 @@ def _compute_spotgeo_score(validation_data: list, true_labels_path: str | Path =
 
 
 def _print_spotgeo(spotgeo: dict) -> None:
-    print(f"\n======================================")
-    print(f"🌟 spotGEO 竞赛指标 🌟")
-    print(f"  Precision : {spotgeo['spotgeo_precision']}")
-    print(f"  Recall    : {spotgeo['spotgeo_recall']}")
-    print(f"  F1        : {spotgeo['spotgeo_f1']}")
-    print(f"  Score(1-F1): {spotgeo['spotgeo_score']}")
-    print(f"  MSE       : {spotgeo['spotgeo_mse']}")
-    print(f"======================================\n")
+    logger.info("======================================")
+    logger.info("🌟 spotGEO 竞赛指标 🌟")
+    logger.info("  Precision : %s", spotgeo['spotgeo_precision'])
+    logger.info("  Recall    : %s", spotgeo['spotgeo_recall'])
+    logger.info("  F1        : %s", spotgeo['spotgeo_f1'])
+    logger.info("  Score(1-F1): %s", spotgeo['spotgeo_score'])
+    logger.info("  MSE       : %s", spotgeo['spotgeo_mse'])
+    logger.info("======================================")
 
 
 def _print_seq_stats(validation_data: list) -> None:
     """打印序列级检测统计"""
     seq_stats = _compute_sequence_stats(validation_data)
-    print("\n========== 序列级检测统计 ==========")
-    print(f"  {'序列ID':<12} {'总帧数':<10} {'有检测帧':<10} {'检测率':<10} {'总目标数':<10}")
-    print("  " + "-" * 52)
+    logger.info("========== 序列级检测统计 ==========")
+    logger.info("  %-12s %-10s %-10s %-10s %-10s", "序列ID", "总帧数", "有检测帧", "检测率", "总目标数")
+    logger.info("  " + "-" * 52)
     total_frames_with_det = 0
     total_detections = 0
     for seq in seq_stats:
-        print(f"  {seq['sequence_id']:<12} {seq['total_frames']:<10} "
-              f"{seq['frames_with_detections']:<10} "
-              f"{seq['detection_rate']:<10.2%} {seq['total_detections']:<10}")
+        logger.info("  %-12s %-10s %-10s %-10.2%% %-10s",
+                    seq['sequence_id'], seq['total_frames'],
+                    seq['frames_with_detections'],
+                    seq['detection_rate'] * 100, seq['total_detections'])
         total_frames_with_det += seq['frames_with_detections']
         total_detections += seq['total_detections']
-    print("  " + "-" * 52)
-    print(f"  {'合计':<12} {'':<10} {total_frames_with_det:<10} {'':<10} {total_detections:<10}")
-    print("====================================\n")
+    logger.info("  " + "-" * 52)
+    logger.info("  %-12s %-10s %-10s %-10s %-10s", "合计", "", total_frames_with_det, "", total_detections)
+    logger.info("====================================")
 
 
 def _run_inference(
@@ -244,10 +239,10 @@ def evaluate(
 
     model = YOLO(str(weights_path))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[Evaluate] 模型: {weights_path} | 设备: {device} | 预处理: {'开启' if enable_preprocess else '关闭'}")
+    logger.info("模型: %s | 设备: %s | 预处理: %s", weights_path, device, "开启" if enable_preprocess else "关闭")
 
     # ===== 1. 推理 + 计时 =====
-    print("\n[Evaluate] 开始推理...")
+    logger.info("开始推理...")
     predictions, inference_times, total_images = _run_inference(
         model=model, source_dirs=source_dirs,
         enable_preprocess=enable_preprocess,
@@ -279,20 +274,20 @@ def evaluate(
         json_path = save_dir / "spotgeo_predictions.json"
         with json_path.open("w", encoding="utf-8") as f:
             json.dump(validation_data, f, indent=4, ensure_ascii=False)
-        print(f"[Evaluate] spotGEO JSON 已保存: {json_path}")
+        logger.info("spotGEO JSON 已保存: %s", json_path)
 
         # 可视化
         viz_dir = save_dir / "visualizations"
         viz_dir.mkdir(parents=True, exist_ok=True)
         n_viz = visualize_detections(predictions, out_dir=viz_dir, max_images=max_visualize, conf=conf)
-        print(f"[Evaluate] 可视化: 已保存 {n_viz} 张到 {viz_dir}")
+        logger.info("可视化: 已保存 %s 张到 %s", n_viz, viz_dir)
 
         # 序列统计
         seq_stats = _compute_sequence_stats(validation_data)
         stats_path = save_dir / "sequence_stats.json"
         with stats_path.open("w", encoding="utf-8") as f:
             json.dump(seq_stats, f, indent=2, ensure_ascii=False)
-        print(f"[Evaluate] 序列统计已保存: {stats_path}")
+        logger.info("序列统计已保存: %s", stats_path)
 
         # 综合指标
         metrics = {
@@ -305,7 +300,7 @@ def evaluate(
         metrics_path = save_dir / "metrics.json"
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2, ensure_ascii=False)
-        print(f"[Evaluate] 完整指标已保存: {metrics_path}")
+        logger.info("完整指标已保存: %s", metrics_path)
     else:
         metrics = {
             "model": str(weights_path),
@@ -331,23 +326,15 @@ def _predict_direct(
     """不使用预处理，直接目录推理（批量 + CUDA 同步计时）"""
     all_paths = _resolve_sources(source_dirs)
     if not all_paths:
-        print("[Evaluate] 未找到图像文件")
+        logger.warning("未找到图像文件")
         return [], [], 0
 
     predictions = []
     inference_times = []
     total_images = 0
+    warmup_done = False
 
-    # 预热
-    warmup_imgs = []
-    for p in all_paths[:20]:
-        img = cv2.imread(str(p))
-        if img is not None:
-            warmup_imgs.append(img)
-    if warmup_imgs:
-        _ = model(warmup_imgs, verbose=False)
-
-    # 批量推理
+    # 批量推理（首个 batch 同时用于预热）
     for start in range(0, len(all_paths), batch_size):
         batch_paths = all_paths[start:start + batch_size]
         batch_images = []
@@ -360,6 +347,11 @@ def _predict_direct(
 
         if not batch_images:
             continue
+
+        # 使用第一个有效 batch 做预热，不重复加载
+        if not warmup_done:
+            _ = model(batch_images, verbose=False)
+            warmup_done = True
 
         total_images += len(batch_images)
         batch_results, elapsed = _time_batch(model, batch_images, conf=conf, device=device)
@@ -410,14 +402,8 @@ def _predict_with_dataloader(
     inference_times = []
     total_images = 0
 
-    # 预热（取第一个 batch）
-    for batch in loader:
-        warmup_imgs = _extract_images_from_batch(batch)
-        if warmup_imgs is not None:
-            _ = model(warmup_imgs.to(device), verbose=False)
-        break
-
-    # 正式推理
+    # 正式推理（首个 batch 同时用于预热）
+    warmup_done = False
     for batch in loader:
         images = _extract_images_from_batch(batch)
         im_files = _extract_file_names_from_batch(batch)
@@ -425,6 +411,12 @@ def _predict_with_dataloader(
             continue
 
         images = images.to(device)
+
+        # 使用第一个有效 batch 做预热，避免重复加载
+        if not warmup_done:
+            _ = model(images, verbose=False)
+            warmup_done = True
+
         total_images += images.size(0)
         batch_results, elapsed = _time_batch(model, images, conf=conf, device=device)
         inference_times.append(elapsed)
@@ -544,7 +536,7 @@ def visualize_detections(
 
         # ---- 统计信息 ----
         n_truth = 0
-        n_pred = best_result.boxes is not None and len(best_result.boxes.xyxy) or 0
+        n_pred = len(best_result.boxes.xyxy) if best_result.boxes is not None else 0
         pred_confs = []
         tp_count = 0
 
@@ -649,22 +641,22 @@ def main():
             if exp_dirs:
                 weights_path = str(exp_dirs[-1] / "weights" / "best.pt")
             else:
-                print(f"错误: 在 {output_dir} 下未找到 exp* 目录")
+                logger.error("在 %s 下未找到 exp* 目录", output_dir)
                 return
 
         sources = cfg.get("val_data_dir", [])
         if isinstance(sources, str):
             sources = [sources]
-        print(f"[evaluate.py] 从配置文件读取: weights={weights_path}, data={sources}")
+        logger.info("从配置文件读取: weights=%s, data=%s", weights_path, sources)
     else:
-        print("错误: 请提供 --weights + --data 或 --config")
-        print("示例: python evaluate.py --weights runs/detect/exp/weights/best.pt --data D:/Dataset/val")
+        logger.error("请提供 --weights + --data 或 --config")
+        logger.error("示例: python evaluate.py --weights runs/detect/exp/weights/best.pt --data D:/Dataset/val")
         return
 
     # 检查权重是否存在
     if not Path(weights_path).exists():
-        print(f"错误: 权重文件不存在: {weights_path}")
-        print("请通过 --weights 手动指定正确的权重路径")
+        logger.error("权重文件不存在: %s", weights_path)
+        logger.error("请通过 --weights 手动指定正确的权重路径")
         return
 
     metrics = evaluate(

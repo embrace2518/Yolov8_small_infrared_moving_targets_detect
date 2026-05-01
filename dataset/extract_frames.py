@@ -2,6 +2,10 @@ import argparse
 import shutil
 from pathlib import Path
 
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 def natural_key(path: Path):
     """Sort by numeric stem when possible (e.g., 2.png < 10.png)."""
@@ -78,14 +82,14 @@ def main():
         count, kept = sample_sequence(seq_dir, out_seq_dir, args.k, args.offset, exts, args.overwrite)
         total_files += count
         total_kept += kept
-        print(f"[seq] {seq_dir.name}: {kept}/{count} kept")
+        logger.info("%s: %s/%s kept", seq_dir.name, kept, count)
 
     if seq_count == 0:
-        print("No sequence folders found under input root.")
+        logger.warning("No sequence folders found under input root.")
     else:
         ratio = (100.0 * total_kept / total_files) if total_files else 0.0
-        print(f"Done. sequences={seq_count}, kept={total_kept}/{total_files} ({ratio:.2f}%)")
-        print(f"Output: {output_root}")
+        logger.info("Done. sequences=%s, kept=%s/%s (%.2f%%)", seq_count, total_kept, total_files, ratio)
+        logger.info("Output: %s", output_root)
 
 
 if __name__ == "__main__":
