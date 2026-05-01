@@ -300,6 +300,8 @@ class DataLoaderCompatibleTrainer(DetectionTrainer):
 
         # force disable YOLO default plots which locks up processes
         val_args["plots"] = False
+        # disable TTA: IR-YOLOv8n's multi-scale Concat paths misalign under augment flips/scales
+        val_args["augment"] = False
         # pass in custom_val_loader so the validator overrides its own dataloader
         val_args["val_loader"] = getattr(self, 'custom_val_loader', None)
 
@@ -699,7 +701,12 @@ class CustomTrainer:
 
 
     @staticmethod
-    def _assert_resume_checkpoint(checkpoint_path: Path) -> None:
+    def _check_resume_checkpoint(checkpoint_path: Path) -> tuple[bool, dict]:
+        """Return (can_full_resume, checkpoint_dict).
+
+        can_full_resume=True means the checkpoint has epoch & optimizer state
+        for true YOLO resume.  Otherwise only model weights are usable.
+        """
         if not checkpoint_path.exists() or not checkpoint_path.is_file():
             raise FileNotFoundError(
                 f"[Trainer] resume checkpoint not found: {checkpoint_path}. "
@@ -710,10 +717,8 @@ class CustomTrainer:
             raise ValueError(f"[Trainer] resume file must be a .pt checkpoint, got: {checkpoint_path}")
 
         try:
-            # PyTorch>=2.6 defaults to weights_only=True which drops optimizer/epoch state.
             checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
         except TypeError:
-            # Compatibility fallback for older torch versions without weights_only argument.
             checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
         except Exception as exc:
             raise ValueError(f"[Trainer] failed to read checkpoint: {checkpoint_path} ({exc})") from exc
@@ -721,13 +726,10 @@ class CustomTrainer:
         if not isinstance(checkpoint, dict):
             raise ValueError(f"[Trainer] invalid checkpoint format: {checkpoint_path}")
 
-        epoch_ok = checkpoint.get("epoch") is not None
-        optimizer_ok = checkpoint.get("optimizer") is not None
-        if not (epoch_ok and optimizer_ok):
-            raise ValueError(
-                f"[Trainer] checkpoint lacks resume state (epoch/optimizer): {checkpoint_path}. "
-                "Use a true last.pt instead of best.pt for resume training."
-            )
+        epoch = checkpoint.get("epoch")
+        optimizer = checkpoint.get("optimizer")
+        can_full_resume = (epoch is not None and epoch >= 0 and optimizer is not None)
+        return can_full_resume, checkpoint
 
     def _build_train_args(self, epochs: int, lr0: float, patience: int, name: str) -> dict:
         """Build the common training args dict shared across all training entry points.
@@ -803,10 +805,19 @@ class CustomTrainer:
         resume_flag: bool = False
         if resume_from:
             resume_path = Path(resume_from)
-            self._assert_resume_checkpoint(resume_path)
-            self.model = YOLO(resume_path)
-            resume_flag = True
-            logger.info("resume from: %s", resume_path)
+            can_resume, _ = self._check_resume_checkpoint(resume_path)
+            if can_resume:
+                self.model = YOLO(resume_path)
+                resume_flag = True
+                logger.info("resume from: %s", resume_path)
+            else:
+                # checkpoint lacks epoch/optimizer — use weights only, start fresh
+                logger.info("checkpoint has no training state, loading weights only")
+                if self.config.use_ir_model:
+                    self._load_pretrained_into_ir(resume_path)
+                else:
+                    self.model = YOLO(resume_path)
+                resume_flag = False
 
         dataset_yaml = self.stage_dataset_yaml()
 
