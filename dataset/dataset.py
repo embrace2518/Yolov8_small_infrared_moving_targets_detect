@@ -51,6 +51,8 @@ class SequenceData:
 
 
 class YOLODataset(Dataset):
+    _recursive_guard: bool = False  # 防止 CopyPaste/Mosaic 触发递归增强
+
     def __init__(self, config: DatasetConfig, mode: str, copy_paste_prob: float = 0.3) -> None:
         self.config = config
         self.mode = mode
@@ -233,33 +235,31 @@ class YOLODataset(Dataset):
         image = self._load_image(seq_idx, frame_idx)
         labels = self._load_yolo_labels(seq_idx, frame_idx)
 
-        # 时序堆叠：如果配置了3通道输入，我们将 t-1, t, t+1 堆叠起来
         channels = int(getattr(self, "channels", 1))
 
         if channels == 3:
+            # 帧间差分: [frame_t, |frame_t - frame_{t-1}|, |frame_t - frame_{t-2}|]
             seq_len = len(self.sequences[seq_idx])
+            prev1_idx = max(0, frame_idx - 1)
+            prev2_idx = max(0, frame_idx - 2)
 
-            # Get previous and next frames (boundary: clamp to edges)
-            prev_frame_idx = max(0, frame_idx - 1)
-            next_frame_idx = min(seq_len - 1, frame_idx + 1)
+            image_prev1 = self._load_image(seq_idx, prev1_idx) if prev1_idx != frame_idx else image
+            image_prev2 = self._load_image(seq_idx, prev2_idx) if prev2_idx != frame_idx else image
 
-            # Only load adjacent frames — current frame image is already loaded above
-            image_prev = self._load_image(seq_idx, prev_frame_idx) if prev_frame_idx != frame_idx else image
-            image_next = self._load_image(seq_idx, next_frame_idx) if next_frame_idx != frame_idx else image
-
-            # Resize
             image = self._resize_image(image)
-            image_prev = self._resize_image(image_prev)
-            image_next = self._resize_image(image_next)
+            image_prev1 = self._resize_image(image_prev1)
+            image_prev2 = self._resize_image(image_prev2)
 
-            # Stack into CHW: 3 x H x W
-            stacked = np.stack([image_prev, image, image_next], axis=0)
+            diff1 = np.abs(image.astype(np.int16) - image_prev1.astype(np.int16)).astype(np.uint8)
+            diff2 = np.abs(image.astype(np.int16) - image_prev2.astype(np.int16)).astype(np.uint8)
+
+            stacked = np.stack([image, diff1, diff2], axis=0)
         else:
             image = self._resize_image(image)
             stacked = image[np.newaxis, ...]  # Shape: 1 x H x W
 
         # 优化：在 DataLoader 端加入强力的数据增强（解决 Bypass YOLO Transformer 的问题），保持时序一致性
-        if self.mode == "train" and self.augmentation:
+        if self.mode == "train" and self.augmentation and not YOLODataset._recursive_guard:
             stacked, labels = self.augmentation.apply(stacked, labels)
 
         # 优化：直接返回 uint8 张量，将除以 255.0 以及转 float 的算力推延到 GPU 端进行，节约 75% 的 PCIe 数据带宽

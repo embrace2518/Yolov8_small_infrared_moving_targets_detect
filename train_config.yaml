@@ -20,23 +20,18 @@ output_dir: "runs/detect"
 dataset_config_path: "dataset/dataset_config.yaml"
 
 # Model
-base_model: "models/yolov8.yaml"
-# IR-YOLOv8n 改进配置
-use_ir_model: true             # true → 使用 ir_yolov8n.yaml（P2 + ECA + GSConv）
-model_yaml: "models/ir_yolov8n.yaml"  # IR 模型结构 YAML 路径
-wiou_loss: true                 # true → 回归损失用 WIoU（NWD 标签分配始终保留）
-# 两阶段训练（先训标准YOLOv8n基线，再微调IR-YOLOv8n）
-two_stage: false                # true → 自动两阶段训练（需要 use_ir_model: true）
-stage1_epochs: 60               # 阶段1：基线训练epoch数
-
+base_model: "models/yolov8.yaml"  # 模型结构 YAML，文件名含 ir_ 则自动启用 ECA+GSConv+P2
+wiou_loss: false                 # true → 回归损失用 WIoU
+use_nwd: true                   # true → 标签分配混入 NWD（小目标匹配更友好）
+use_preprocess: false           # true → 训练时开启 NUC+去噪+CLAHE+Gamma
 pretrained: true
-pretrained_weights: "runs/detect/exp_20260429_094305/weights/best.pt"
+pretrained_weights: "models/yolov8n.pt"
 class_names: ["target"]
 num_classes: 1
-input_channels: 3
+input_channels: 3  # 3 → [frame_t, |t - t-1|, |t - t-2|] 帧间差分；1 → 单帧灰度
 
 # Train
-epochs: 120
+epochs: 100
 batch_size: 16
 imgsz: 640
 device: "cuda"
@@ -61,14 +56,10 @@ copy_paste: 0.3
 
 # Control
 seed: 42
-patience: 10
+patience: 20
 save_period: 10
 run_name: null
 clip_grad: 1.0
 
-# 预处理对比评估
-# 开启后，训练结束时会对验证集分别评估 无预处理 / 有预处理 的图像，输出对比结果。
-# 注意：实际的预处理是否在训练中使用，取决于 dataset_config.yaml 的 enable_preprocess。
-#       这个开关只是用来做对比实验，验证预处理的效果。
 enable_preprocess_eval: false
 

@@ -115,7 +115,7 @@ def patched_bbox_iou(box1, box2, xywh=False, GIoU=False, DIoU=False, CIoU=False,
 
     # ----- Path 1: NWD for label assignment (TAL) -----
     # TAL calls bbox_iou with CIoU=False, xywh=False → NWD blend
-    if not xywh and not CIoU:
+    if patched_bbox_iou._use_nwd and not xywh and not CIoU:
         nwd = bbox_nwd(box1, box2, eps)
         nwd = nwd.view(iou.shape)
         nwd = torch.nan_to_num(nwd, nan=0.0, posinf=0.0, neginf=0.0)
@@ -129,7 +129,8 @@ def patched_bbox_iou(box1, box2, xywh=False, GIoU=False, DIoU=False, CIoU=False,
 
     return iou
 
-# Default: WIoU disabled until explicitly enabled by TrainingConfig
+# Default: disabled until explicitly enabled by TrainingConfig
+patched_bbox_iou._use_nwd = False
 patched_bbox_iou._use_wiou = False
 
 # Apply monkey patches
@@ -195,17 +196,11 @@ class TrainingConfig:
     #       这个开关的作用是：即使训练时关闭预处理，也能在验证时临时开启来看效果。
     enable_preprocess_eval: bool = False
 
-    # ===== IR-YOLOv8n 改进开关 =====
-    use_ir_model: bool = False      # True → 使用 models/ir_yolov8n.yaml + P2检测层
-    model_yaml: str = "models/yolov8.yaml"  # 模型结构 YAML 路径
-    wiou_loss: bool = True          # True → 回归损失用 WIoU（NWD 标签分配始终保留）
+    # ===== 消融实验开关 =====
+    wiou_loss: bool = True          # True → 回归损失用 WIoU
+    use_nwd: bool = True            # True → 标签分配混入 NWD（小目标匹配更友好）
+    use_preprocess: bool = False    # True → 训练时开启 NUC+去噪+CLAHE+Gamma
     copy_paste: float = 0.3         # Copy-Paste 增强概率（0=关闭）
-
-    # ===== 两阶段训练 =====
-    two_stage: bool = False         # True → 先训标准YOLOv8n基线，再微调IR-YOLOv8n
-    stage1_epochs: int = 60         # 阶段1：基线的epoch数
-    stage1_run_name: Optional[str] = None  # 阶段1的run_name，可选
-
 
     @staticmethod
     def to_path_list(value):
@@ -536,23 +531,23 @@ class CustomTrainer:
         np.random.seed(config.seed)
 
         self.unified_config: UnifiedConfig = load_preprocess_config(config.dataset_config_path)
+        self.unified_config.enable_preprocess = self.config.use_preprocess
         self.train_loader, self.val_loader = self.create_dataloaders()
         self.model_source = self._resolve_model_source()
 
         # IR-YOLOv8n: load from YAML then load pretrained weights
-        if self.config.use_ir_model:
+        if self._is_ir_model():
             from models.custom_modules import ECA, GSConv, C2f_GS  # noqa: ensure registration
-            self.model = YOLO(self.config.model_yaml)
-            self._ir_pretrained_loaded = False
+            self.model = YOLO(self.config.base_model)
             if self.config.pretrained and self.config.pretrained_weights:
                 self._load_pretrained_into_ir(self.config.pretrained_weights)
-                self._ir_pretrained_loaded = True
                 # Hand off the built DetectionModel to the trainer via class-level slot
                 DataLoaderCompatibleTrainer._pretrained_detection_model = self.model.model
         else:
             self.model = YOLO(self.model_source)
 
-        # Set WIoU flag on the patched function (scope it to the function, not the module)
+        # Set NWD/WIoU flags on the patched function
+        patched_bbox_iou._use_nwd = self.config.use_nwd
         patched_bbox_iou._use_wiou = self.config.wiou_loss
 
         # ===== 预处理对比评估 =====
@@ -595,10 +590,14 @@ class CustomTrainer:
             return "cpu"
         return requested
 
+    def _is_ir_model(self) -> bool:
+        """Detect IR-YOLOv8n from base_model filename (e.g. models/ir_yolov8n.yaml)."""
+        return "ir_" in Path(self.config.base_model).name.lower()
+
     def _resolve_model_source(self) -> str:
         if self.config.pretrained and self.config.pretrained_weights:
             return self.config.pretrained_weights
-        return self.config.model_yaml if self.config.use_ir_model else self.config.base_model
+        return self.config.base_model
 
 
     def _load_pretrained_into_ir(self, weights_path: str | Path) -> None:
@@ -798,10 +797,6 @@ class CustomTrainer:
                         p.data.masked_fill_(~mask, 0.0)
 
     def train(self, resume_from: Optional[Path] = None) -> Any:
-        # ===== 两阶段训练 =====
-        if self.config.two_stage and self.config.use_ir_model and resume_from is None:
-            return self._train_two_stage()
-
         resume_flag: bool = False
         if resume_from:
             resume_path = Path(resume_from)
@@ -813,7 +808,7 @@ class CustomTrainer:
             else:
                 # checkpoint lacks epoch/optimizer — use weights only, start fresh
                 logger.info("checkpoint has no training state, loading weights only")
-                if self.config.use_ir_model:
+                if self._is_ir_model():
                     self._load_pretrained_into_ir(resume_path)
                 else:
                     self.model = YOLO(resume_path)
@@ -843,72 +838,6 @@ class CustomTrainer:
             )
 
         self.last_train_results = self.model.train(**train_args)
-
-        # ===== 预处理对比评估 =====
-        if self.config.enable_preprocess_eval:
-            logger.info("")
-            logger.info("=" * 70)
-            logger.info("正在进行预处理对比评估...")
-            logger.info("=" * 70)
-            self._run_preprocess_comparison()
-
-        return self.last_train_results
-
-    def _train_two_stage(self) -> Any:
-        """两阶段训练：Stage 1 = 标准YOLOv8n → Stage 2 = IR-YOLOv8n"""
-
-        # ---------- Stage 1: 标准 YOLOv8n ----------
-        logger.info("")
-        logger.info("=" * 70)
-        logger.info("Two-Stage: Stage 1/2: 训练标准YOLOv8n (%s epochs)", self.config.stage1_epochs)
-        logger.info("=" * 70)
-
-        # Temporarily switch to standard model
-        self.model = YOLO(self.config.base_model)
-
-        stage1_name = self.config.stage1_run_name or f"{self.run_name}_stage1"
-        stage1_args = self._build_train_args(
-            epochs=self.config.stage1_epochs,
-            lr0=self.config.learning_rate,
-            patience=int(self.config.patience / 2),
-            name=stage1_name,
-        )
-
-        stage1_results = self.model.train(**stage1_args)
-
-        # Find best stage 1 weights
-        stage1_weights = self.output_dir / stage1_name / "weights" / "best.pt"
-        if not stage1_weights.exists():
-            stage1_weights = self.output_dir / stage1_name / "weights" / "last.pt"
-        logger.info("")
-        logger.info("Two-Stage: Stage 1 complete. Best weights: %s", stage1_weights)
-
-        # ---------- Stage 2: IR-YOLOv8n ----------
-        logger.info("")
-        logger.info("=" * 70)
-        logger.info("Two-Stage: Stage 2/2: 微调IR-YOLOv8n (%s epochs)", self.config.epochs)
-        logger.info("=" * 70)
-
-        # Re-init for IR-YOLOv8n
-        from models.custom_modules import ECA, GSConv, C2f_GS  # noqa: ensure registration
-        self.model = YOLO(self.config.model_yaml)
-        self._load_pretrained_into_ir(str(stage1_weights))
-        # Hand off the built DetectionModel to the trainer
-        DataLoaderCompatibleTrainer._pretrained_detection_model = self.model.model
-
-        self.model.add_callback("on_model_save", self._sanitize_ema_before_save)
-
-        # Update WIoU on the patched function
-        patched_bbox_iou._use_wiou = self.config.wiou_loss
-
-        stage2_args = self._build_train_args(
-            epochs=self.config.epochs,
-            lr0=self.config.learning_rate * 0.1,  # 微调使用更低学习率
-            patience=self.config.patience,
-            name=self.run_name,
-        )
-
-        self.last_train_results = self.model.train(**stage2_args)
 
         # ===== 预处理对比评估 =====
         if self.config.enable_preprocess_eval:

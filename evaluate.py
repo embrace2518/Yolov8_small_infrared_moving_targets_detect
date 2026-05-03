@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
                         help="实验名称（默认自动生成）")
     parser.add_argument("--true-labels", type=str, default="dataset/true_labels.json",
                         help="真实标签 JSON 路径（默认 dataset/true_labels.json）")
+    parser.add_argument("--track", action="store_true",
+                        help="启用轨迹关联跟踪")
+    parser.add_argument("--min-hits", type=int, default=3,
+                        help="轨迹确认所需最小连续命中帧数（默认 3）")
+    parser.add_argument("--max-age", type=int, default=10,
+                        help="轨迹丢失后保留的最大帧数（默认 10）")
 
     return parser.parse_args()
 
@@ -210,6 +216,9 @@ def evaluate(
     conf: float = 0.1,
     no_save: bool = False,
     true_labels_path: str | Path = "dataset/true_labels.json",
+    enable_tracking: bool = False,
+    min_hits: int = 3,
+    max_age: int = 10,
 ) -> dict:
     """
     核心评估函数：对一个模型在指定数据上做完整评估。
@@ -227,6 +236,9 @@ def evaluate(
         conf: 检测置信度阈值
         no_save: 不保存结果到磁盘
         true_labels_path: 真实标签 JSON 路径（spotGEO 评分用）
+        enable_tracking: 是否启用轨迹关联跟踪
+        min_hits: 轨迹确认所需最小连续命中帧数
+        max_age: 轨迹丢失后保留的最大帧数
 
     Returns:
         metrics: 包含所有评估指标的字典
@@ -261,10 +273,23 @@ def evaluate(
     if spotgeo_metrics:
         _print_spotgeo(spotgeo_metrics)
 
-    # ===== 4. 序列统计打印 =====
+    # ===== 4. 轨迹关联跟踪（可选）=====
+    tracking_data = []
+    tracking_metrics = {}
+    if enable_tracking:
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("开始轨迹关联跟踪...")
+        logger.info("=" * 70)
+        tracking_data, tracking_metrics = _run_tracking(
+            predictions, min_hits=min_hits, max_age=max_age,
+        )
+        _print_tracking_metrics(tracking_metrics)
+
+    # ===== 5. 序列统计打印 =====
     _print_seq_stats(validation_data)
 
-    # ===== 5. 保存结果 =====
+    # ===== 6. 保存结果 =====
     if not no_save:
         run_name = run_name or _resolve_run_name(weights_path)
         save_dir = Path(output_dir) / run_name
@@ -294,20 +319,31 @@ def evaluate(
             "model": str(weights_path),
             "data": [str(s) for s in source_dirs],
             "enable_preprocess": enable_preprocess,
+            "enable_tracking": enable_tracking,
             **fps_metrics,
             **spotgeo_metrics,
+            **tracking_metrics,
         }
         metrics_path = save_dir / "metrics.json"
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2, ensure_ascii=False)
         logger.info("完整指标已保存: %s", metrics_path)
+
+        # 跟踪结果 JSON
+        if tracking_data:
+            track_path = save_dir / "tracking_results.json"
+            with track_path.open("w", encoding="utf-8") as f:
+                json.dump(tracking_data, f, indent=2, ensure_ascii=False)
+            logger.info("跟踪结果已保存: %s", track_path)
     else:
         metrics = {
             "model": str(weights_path),
             "data": [str(s) for s in source_dirs],
             "enable_preprocess": enable_preprocess,
+            "enable_tracking": enable_tracking,
             **fps_metrics,
             **spotgeo_metrics,
+            **tracking_metrics,
         }
 
     return metrics
@@ -476,6 +512,154 @@ def _predictions_to_json(predictions: list) -> list:
             "object_coords": object_coords,
         })
     return validation_data
+
+
+def _run_tracking(
+    predictions: list,
+    min_hits: int = 3,
+    max_age: int = 10,
+) -> tuple[list, dict]:
+    """
+    按序列运行 SORT 跟踪器。
+
+    Returns:
+        tracking_data: 扁平化的跟踪结果列表（同 spotGEO 格式但含 track_id）
+        tracking_metrics: 汇总指标
+    """
+    from mot import SORTTracker, compute_mot_metrics
+
+    # 按序列分组
+    seq_results: dict[str, list] = {}
+    for result in predictions:
+        img_path = Path(str(result.path))
+        parent_name = img_path.parent.name
+        seq_match = re.search(r"(\d+)", parent_name)
+        seq_id = seq_match.group(1) if seq_match else parent_name
+        seq_results.setdefault(seq_id, []).append(result)
+
+    all_track_data: list[dict] = []
+    seq_track_results: list[list[dict]] = []
+    seq_gt_labels: list[list[dict]] = []
+    total_trajectories = 0
+
+    tracker = SORTTracker(min_hits=min_hits, max_age=max_age)
+
+    for seq_id in sorted(seq_results.keys(), key=lambda x: int(x) if x.isdigit() else x):
+        seq_frames = seq_results[seq_id]
+        tracker.reset()
+        seq_tracks: list[list[dict]] = []
+        seq_gt: list[list[dict]] = []
+
+        for frame_idx, result in enumerate(seq_frames):
+            # Extract detections [N, 4] in xyxy
+            boxes = result.boxes
+            if boxes is not None and len(boxes.xyxy) > 0:
+                dets = boxes.xyxy.cpu().numpy()
+            else:
+                dets = np.zeros((0, 4), dtype=np.float32)
+
+            # Run tracker
+            tracks = tracker.update(dets, frame_idx)
+            seq_tracks.append(tracks)
+
+            # Build output data for this frame
+            img_path = Path(str(result.path))
+            stem_name = img_path.stem
+            frame_match = re.search(r"(\d+)", stem_name)
+            frame_num = _to_int_or_self(frame_match.group(1)) if frame_match else frame_idx
+
+            track_coords = []
+            for t in tracks:
+                if t["confirmed"]:
+                    bbox = t["bbox"]
+                    track_coords.append({
+                        "track_id": t["id"],
+                        "cx": float((bbox[0] + bbox[2]) / 2.0),
+                        "cy": float((bbox[1] + bbox[3]) / 2.0),
+                    })
+
+            all_track_data.append({
+                "sequence_id": seq_id,
+                "frame": frame_num,
+                "num_tracks": len(track_coords),
+                "tracks": track_coords,
+            })
+
+            # Ground truth for this frame
+            gt_boxes = []
+            label_path = img_path.with_suffix(".txt")
+            if label_path.exists():
+                try:
+                    with open(label_path, "r") as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                _, xc, yc, bw, bh = map(float, parts[:5])
+                                gt_boxes.append({
+                                    "bbox": [
+                                        xc - bw / 2, yc - bh / 2,
+                                        xc + bw / 2, yc + bh / 2,
+                                    ],
+                                })
+                except Exception:
+                    pass
+            seq_gt.append(gt_boxes)
+
+        seq_track_results.append(seq_tracks)
+        seq_gt_labels.append(seq_gt)
+        total_trajectories += tracker.n_confirmed
+
+    # Compute MOT metrics across all sequences
+    mot_metrics: dict = {}
+    if seq_track_results and seq_gt_labels:
+        try:
+            mot_metrics = compute_mot_metrics(seq_track_results, seq_gt_labels)
+        except Exception as exc:
+            logger.warning("MOT metrics calculation failed: %s", exc)
+
+    mot_metrics["n_trajectories"] = total_trajectories
+    return all_track_data, mot_metrics
+
+
+def _print_tracking_metrics(metrics: dict) -> None:
+    logger.info("========== 轨迹关联指标 ==========")
+    logger.info("  MOTA         : %s", metrics.get('mota', 'N/A'))
+    logger.info("  MOTP         : %s", metrics.get('motp', 'N/A'))
+    logger.info("  IDF1         : %s", metrics.get('idf1', 'N/A'))
+    logger.info("  ID Switches  : %s", metrics.get('id_switches', 'N/A'))
+    logger.info("  TP/FP/FN     : %s / %s / %s",
+                metrics.get('total_tp', 'N/A'),
+                metrics.get('total_fp', 'N/A'),
+                metrics.get('total_fn', 'N/A'))
+    logger.info("  确认轨迹数    : %s", metrics.get('n_trajectories', 'N/A'))
+    logger.info("====================================")
+
+
+def _draw_trajectory_overlay(
+    img: np.ndarray,
+    track_history: dict[int, list[tuple[float, float]]],
+    active_ids: set[int],
+    colors: dict[int, tuple[int, int, int]],
+) -> np.ndarray:
+    """在图像上绘制轨迹路径和当前框。"""
+    for tid, positions in track_history.items():
+        if len(positions) < 2:
+            continue
+        color = colors.get(tid, (255, 255, 0))
+        # Draw path
+        for i in range(1, len(positions)):
+            pt1 = (int(positions[i - 1][0]), int(positions[i - 1][1]))
+            pt2 = (int(positions[i][0]), int(positions[i][1]))
+            fade = 0.3 + 0.7 * (i / len(positions))
+            faded_color = tuple(int(c * fade) for c in color)
+            cv2.line(img, pt1, pt2, faded_color, 1, cv2.LINE_AA)
+        # Mark current position
+        if tid in active_ids:
+            cx, cy = int(positions[-1][0]), int(positions[-1][1])
+            cv2.circle(img, (cx, cy), 4, color, -1)
+            cv2.putText(img, f"ID:{tid}", (cx + 5, cy - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    return img
 
 
 def visualize_detections(
@@ -671,6 +855,9 @@ def main():
         max_visualize=args.max_visualize,
         conf=args.conf,
         true_labels_path=args.true_labels,
+        enable_tracking=args.track,
+        min_hits=args.min_hits,
+        max_age=args.max_age,
     )
 
     print("\n" + "=" * 60)

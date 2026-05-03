@@ -405,11 +405,14 @@ class Mosaic(BaseAugmentation):
         all_labels = [labels]
 
         indices = [random.randint(0, ds_len - 1) for _ in range(3)]
+        from .dataset import YOLODataset
         for idx in indices:
-            img_t, lbl_t, _ = self.dataset[idx]
-            # img_t: [C, H, W] tensor -> numpy
+            YOLODataset._recursive_guard = True
+            try:
+                img_t, lbl_t, _ = self.dataset[idx]
+            finally:
+                YOLODataset._recursive_guard = False
             other_img = img_t.numpy() if hasattr(img_t, 'numpy') else np.array(img_t)
-            # labels可能为 None
             other_lbl = lbl_t.numpy() if hasattr(lbl_t, 'numpy') and len(lbl_t) > 0 else np.zeros((0, 5), dtype=np.float32)
             images.append(other_img)
             all_labels.append(other_lbl)
@@ -630,10 +633,18 @@ class CopyPaste(BaseAugmentation):
             return image, labels
 
         h, w = image.shape[1], image.shape[2]
-        # 从数据集中随机取另一张图
+        # 从数据集中随机取另一张图（跳过增强，防止递归）
         ds_len = len(self.dataset)
         src_idx = random.randint(0, ds_len - 1)
-        src_img, src_labels, _ = self.dataset[src_idx]
+        from .dataset import YOLODataset
+        YOLODataset._recursive_guard = True
+        try:
+            src_img_t, src_labels_t, _ = self.dataset[src_idx]
+        finally:
+            YOLODataset._recursive_guard = False
+
+        src_img = src_img_t.numpy() if hasattr(src_img_t, 'numpy') else np.array(src_img_t)
+        src_labels = src_labels_t.numpy() if hasattr(src_labels_t, 'numpy') else np.array(src_labels_t)
         # dataset 返回的可能是 [C,H,W] 或 [H,W,C]；统一为 [C,H,W] uint8
         if src_img.ndim == 2:
             src_img = np.expand_dims(src_img, axis=0)
@@ -786,21 +797,23 @@ def get_infrared_augmentation_pipeline(mode: str = 'medium', dataset=None,
         ])
     
     elif mode == 'medium':
-        return ComposeAugmentations([
+        aug_list = [
+            CopyPaste(p=copy_paste_prob, dataset=dataset),
             RandomHorizontalFlip(p=0.5),
-            RandomVerticalFlip(p=0.3),
+            RandomVerticalFlip(p=0.5),
             RandomBrightnessContrast(p=0.7, brightness_delta=0.3, contrast_delta=0.3),
             RandomNoise(noise_type='gaussian', gaussian_std=0.03, p=0.3),
+            RandomBlur(max_kernel=3, blur_type='gaussian', p=0.2),
             RandomTranslate(max_translate=0.1, p=0.3),
-        ])
+        ]
+        return ComposeAugmentations(aug_list)
     
     else:  # 'heavy'
         aug_list = [
+            CopyPaste(p=copy_paste_prob, dataset=dataset),
             RandomHorizontalFlip(p=0.5),
-            RandomVerticalFlip(p=0.3),
+            RandomVerticalFlip(p=0.5),
         ]
-        if copy_paste_prob > 0 and dataset is not None:
-            aug_list.append(CopyPaste(p=copy_paste_prob, dataset=dataset))
         aug_list.extend([
             Mosaic(p=0.3, target_size=640, dataset=dataset),
             RandomRotate90(p=0.3),
