@@ -39,13 +39,18 @@ def main() -> None:
     trainer = CustomTrainer(config)
     trainer.train(resume_from=Path(args.resume) if args.resume else None)
 
-    csv_path = trainer.output_dir / trainer.run_name / "results.csv"
-    plot_results(csv_path, trainer.output_dir / trainer.run_name)
+    # Use YOLO's actual save_dir (may differ from self-constructed path due to exist_ok reuse)
+    save_dir = trainer.model.trainer.save_dir
+    csv_path = save_dir / "results.csv"
+    if csv_path.exists():
+        plot_results(csv_path, save_dir)
+    else:
+        logger.warning("results.csv not found at %s, skipping plot_results", csv_path)
 
     # == Run Custom Domain spotGEO Validation after default YOLOv8 Evaluation == #
     logger.info("Running ESA spotGEO custom validation on validation set...")
     val_sources = config.val_data_dir
-    best_weights_path = trainer.output_dir / trainer.run_name / "weights" / "best.pt"
+    best_weights_path = save_dir / "weights" / "best.pt"
     
     if best_weights_path.exists():
         from evaluate import evaluate

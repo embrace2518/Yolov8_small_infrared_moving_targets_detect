@@ -5,7 +5,7 @@ nuc:
   alpha: 0.02
 
 denoise:
-  method: nlm        # nlm | bilateral | median | gaussian
+  method: bilateral        # nlm | bilateral | median | gaussian
   kernel: 3
   h: 8               # NLM强度，降低避免过度平滑小目标
 

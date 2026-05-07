@@ -50,7 +50,6 @@ from validation import (
 )
 
 from utils.logging import get_logger
-from utils.args import add_common_eval_args
 
 logger = get_logger(__name__)
 
@@ -58,7 +57,18 @@ logger = get_logger(__name__)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="独立评估接口：YOLO mAP + spotGEO + FPS")
 
-    add_common_eval_args(parser)
+    parser.add_argument("--weights", type=str, default=None,
+                        help="模型权重路径 (.pt)")
+    parser.add_argument("--conf", type=float, default=0.1,
+                        help="检测置信度阈值（默认 0.1）")
+    parser.add_argument("--preprocess", action="store_true",
+                        help="启用预处理（NUC+去噪+CLAHE+Gamma）")
+    parser.add_argument("--output-dir", type=str, default="runs/evaluate",
+                        help="输出目录")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="推理批量大小（默认 32）")
+    parser.add_argument("--img-size", type=int, default=640,
+                        help="图像输入尺寸（默认 640）")
     parser.add_argument("--data", type=str, nargs="+", default=None,
                         help="评估数据目录，支持多个目录")
     parser.add_argument("--config", type=str, default=None,

@@ -16,7 +16,7 @@
 ```powershell
 python train.py --config train_config.yaml
 
-python train.py --config train_config.yaml --resume runs/detect/exp_20260501_173906/weights/best.pt
+python train.py --config train_config.yaml --resume runs/detect/exp_20260504_212235/weights/last.pt
 ```
 
 ## 4) 评估

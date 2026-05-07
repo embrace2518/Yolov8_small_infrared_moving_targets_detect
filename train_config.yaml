@@ -20,18 +20,18 @@ output_dir: "runs/detect"
 dataset_config_path: "dataset/dataset_config.yaml"
 
 # Model
-base_model: "models/yolov8.yaml"  # 模型结构 YAML，文件名含 ir_ 则自动启用 ECA+GSConv+P2
-wiou_loss: false                 # true → 回归损失用 WIoU
+base_model: "models/ir_yolov8n.yaml"  # 模型结构 YAML，文件名含 ir_ 则自动启用 ECA+GSConv+P2
+wiou_loss: true                 # true → 回归损失用 WIoU
 use_nwd: true                   # true → 标签分配混入 NWD（小目标匹配更友好）
-use_preprocess: false           # true → 训练时开启 NUC+去噪+CLAHE+Gamma
+use_preprocess: true           # true → 训练时开启 NUC+去噪+CLAHE+Gamma
 pretrained: true
-pretrained_weights: "models/yolov8n.pt"
+pretrained_weights: "runs/detect/exp_20260504_182517/weights/best.pt"
 class_names: ["target"]
 num_classes: 1
 input_channels: 3  # 3 → [frame_t, |t - t-1|, |t - t-2|] 帧间差分；1 → 单帧灰度
 
 # Train
-epochs: 100
+epochs: 120
 batch_size: 16
 imgsz: 640
 device: "cuda"
@@ -57,7 +57,7 @@ copy_paste: 0.3
 # Control
 seed: 42
 patience: 20
-save_period: 10
+save_period: 5
 run_name: null
 clip_grad: 1.0
 

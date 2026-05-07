@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from .preprocess import ImagePreprocessor, ImageReadError, UnifiedConfig, SceneBasedNUC, read_gray_image
+from .sampling import get_recursion_guard
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -51,7 +52,6 @@ class SequenceData:
 
 
 class YOLODataset(Dataset):
-    _recursive_guard: bool = False  # 防止 CopyPaste/Mosaic 触发递归增强
 
     def __init__(self, config: DatasetConfig, mode: str, copy_paste_prob: float = 0.3) -> None:
         self.config = config
@@ -238,28 +238,29 @@ class YOLODataset(Dataset):
         channels = int(getattr(self, "channels", 1))
 
         if channels == 3:
-            # 帧间差分: [frame_t, |frame_t - frame_{t-1}|, |frame_t - frame_{t-2}|]
+            # 时序堆叠: [|frame_t - frame_{t-1}|, frame_t, |frame_{t+1} - frame_t|]
+            # 一前一后两个差分 + 当前帧，形成以 t 为中心的对称时序窗口
             seq_len = len(self.sequences[seq_idx])
-            prev1_idx = max(0, frame_idx - 1)
-            prev2_idx = max(0, frame_idx - 2)
+            prev_idx = max(0, frame_idx - 1)
+            next_idx = min(seq_len - 1, frame_idx + 1)
 
-            image_prev1 = self._load_image(seq_idx, prev1_idx) if prev1_idx != frame_idx else image
-            image_prev2 = self._load_image(seq_idx, prev2_idx) if prev2_idx != frame_idx else image
+            image_prev = self._load_image(seq_idx, prev_idx) if prev_idx != frame_idx else image
+            image_next = self._load_image(seq_idx, next_idx) if next_idx != frame_idx else image
 
             image = self._resize_image(image)
-            image_prev1 = self._resize_image(image_prev1)
-            image_prev2 = self._resize_image(image_prev2)
+            image_prev = self._resize_image(image_prev)
+            image_next = self._resize_image(image_next)
 
-            diff1 = np.abs(image.astype(np.int16) - image_prev1.astype(np.int16)).astype(np.uint8)
-            diff2 = np.abs(image.astype(np.int16) - image_prev2.astype(np.int16)).astype(np.uint8)
+            diff_prev = np.abs(image.astype(np.int16) - image_prev.astype(np.int16)).astype(np.uint8)
+            diff_next = np.abs(image_next.astype(np.int16) - image.astype(np.int16)).astype(np.uint8)
 
-            stacked = np.stack([image, diff1, diff2], axis=0)
+            stacked = np.stack([diff_prev, image, diff_next], axis=0)
         else:
             image = self._resize_image(image)
             stacked = image[np.newaxis, ...]  # Shape: 1 x H x W
 
         # 优化：在 DataLoader 端加入强力的数据增强（解决 Bypass YOLO Transformer 的问题），保持时序一致性
-        if self.mode == "train" and self.augmentation and not YOLODataset._recursive_guard:
+        if self.mode == "train" and self.augmentation and not get_recursion_guard():
             stacked, labels = self.augmentation.apply(stacked, labels)
 
         # 优化：直接返回 uint8 张量，将除以 255.0 以及转 float 的算力推延到 GPU 端进行，节约 75% 的 PCIe 数据带宽

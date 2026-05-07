@@ -5,23 +5,19 @@ import argparse
 from pathlib import Path
 
 from evaluate import evaluate
-from utils.args import add_common_eval_args
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Quick inference with YOLOv8 model on a directory of images."
     )
-    add_common_eval_args(parser)
-    # Override: --weights is required for main.py
-    for action in parser._actions:
-        if action.dest == "weights":
-            action.required = True
-            break
-    parser.add_argument(
-        "--source", type=str, required=True,
-        help="Path to image directory or file"
-    )
+    parser.add_argument("--weights", type=str, required=True, help="模型权重路径 (.pt)")
+    parser.add_argument("--source", type=str, required=True, help="图像目录或文件路径")
+    parser.add_argument("--conf", type=float, default=0.1, help="检测置信度阈值（默认 0.1）")
+    parser.add_argument("--preprocess", action="store_true", help="启用预处理（NUC+去噪+CLAHE+Gamma）")
+    parser.add_argument("--output-dir", type=str, default="runs/evaluate", help="输出目录")
+    parser.add_argument("--batch-size", type=int, default=32, help="推理批量大小（默认 32）")
+    parser.add_argument("--img-size", type=int, default=640, help="图像输入尺寸（默认 640）")
     return parser.parse_args()
 
 

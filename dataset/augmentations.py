@@ -405,13 +405,13 @@ class Mosaic(BaseAugmentation):
         all_labels = [labels]
 
         indices = [random.randint(0, ds_len - 1) for _ in range(3)]
-        from .dataset import YOLODataset
+        from .sampling import set_recursion_guard
         for idx in indices:
-            YOLODataset._recursive_guard = True
+            set_recursion_guard(True)
             try:
                 img_t, lbl_t, _ = self.dataset[idx]
             finally:
-                YOLODataset._recursive_guard = False
+                set_recursion_guard(False)
             other_img = img_t.numpy() if hasattr(img_t, 'numpy') else np.array(img_t)
             other_lbl = lbl_t.numpy() if hasattr(lbl_t, 'numpy') and len(lbl_t) > 0 else np.zeros((0, 5), dtype=np.float32)
             images.append(other_img)
@@ -636,12 +636,12 @@ class CopyPaste(BaseAugmentation):
         # 从数据集中随机取另一张图（跳过增强，防止递归）
         ds_len = len(self.dataset)
         src_idx = random.randint(0, ds_len - 1)
-        from .dataset import YOLODataset
-        YOLODataset._recursive_guard = True
+        from .sampling import set_recursion_guard
+        set_recursion_guard(True)
         try:
             src_img_t, src_labels_t, _ = self.dataset[src_idx]
         finally:
-            YOLODataset._recursive_guard = False
+            set_recursion_guard(False)
 
         src_img = src_img_t.numpy() if hasattr(src_img_t, 'numpy') else np.array(src_img_t)
         src_labels = src_labels_t.numpy() if hasattr(src_labels_t, 'numpy') else np.array(src_labels_t)

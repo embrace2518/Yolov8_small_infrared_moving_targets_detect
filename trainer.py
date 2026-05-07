@@ -17,129 +17,18 @@ from ultralytics.utils import RANK
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.models.yolo.detect import DetectionTrainer
 
 from dataset.dataset import DatasetConfig, YOLODataset, yolo_collate_fn_with_indices
+from dataset.sampler import SequenceBatchSampler
 from dataset.preprocess import UnifiedConfig, load_config as load_preprocess_config
-from ultralytics.utils.metrics import bbox_iou
+from utils.loss_strategy import LossStrategy, set_validation_mode
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-# ============================================================
-# Loss functions: NWD for label assignment + WIoU for bbox loss
-# ============================================================
-
-
-
-def bbox_nwd(box1, box2, eps=1e-6):
-    """Normalized Wasserstein Distance for small target label assignment."""
-    b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
-    b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
-    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1
-    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1
-    cx1, cy1 = b1_x1 + w1 / 2, b1_y1 + h1 / 2
-    cx2, cy2 = b2_x1 + w2 / 2, b2_y1 + h2 / 2
-    c_dist = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2
-    w_dist = ((w1 - w2) ** 2 + (h1 - h2) ** 2) / 4
-    wass_dist = c_dist + w_dist
-    constant = 12.8
-    nwd = torch.exp(-torch.sqrt(wass_dist + eps) / constant)
-    return nwd
-
-
-def bbox_wiou(box1, box2, xywh=False, eps=1e-7):
-    """
-    WIoU v3: dynamic non-monotonic focusing mechanism.
-    box format: (x1, y1, x2, y2) unless xywh=True.
-    Reference: https://arxiv.org/abs/2301.10051
-    """
-    if xywh:
-        (cx1, cy1, w1, h1), (cx2, cy2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
-        b1_x1, b1_y1 = cx1 - w1 / 2, cy1 - h1 / 2
-        b1_x2, b1_y2 = cx1 + w1 / 2, cy1 + h1 / 2
-        b2_x1, b2_y1 = cx2 - w2 / 2, cy2 - h2 / 2
-        b2_x2, b2_y2 = cx2 + w2 / 2, cy2 + h2 / 2
-    else:
-        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
-        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
-        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1
-        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1
-        cx1, cy1 = (b1_x1 + b1_x2) / 2, (b1_y1 + b1_y2) / 2
-        cx2, cy2 = (b2_x1 + b2_x2) / 2, (b2_y1 + b2_y2) / 2
-
-    # IoU
-    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
-            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
-    union = w1 * h1 + w2 * h2 - inter + eps
-    iou = inter / union
-
-    # Enclosing box (for distance metric)
-    enclose_x1 = torch.min(b1_x1, b2_x1)
-    enclose_y1 = torch.min(b1_y1, b2_y1)
-    enclose_x2 = torch.max(b1_x2, b2_x2)
-    enclose_y2 = torch.max(b1_y2, b2_y2)
-    enclose_w = enclose_x2 - enclose_x1
-    enclose_h = enclose_y2 - enclose_y1
-
-    # Center distance (R_WIoU = exp((c^2) / (wg^2 + hg^2)))
-    c2 = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2
-    diagonal2 = enclose_w ** 2 + enclose_h ** 2 + eps
-    scale_factor = (w2 / w1.exp().clamp(min=1e-7)).detach()  # prevent extreme
-    wiou = iou - (scale_factor * c2 / diagonal2)
-
-    # Focusing mechanism: r = beta / (delta * alpha ^ (beta - delta))
-    # Simplified: r = exp(beta / tau) where beta = IoU - avg(IoU)
-    iou_mean = iou.detach().mean().clamp(min=1e-3)
-    beta = (iou.detach() / iou_mean).clamp(max=50.0)  # prevent overflow
-    r = torch.exp(beta / 3.0).clamp(max=10.0)  # tau=3.0 from paper
-    wiou = wiou * (1 - 1 / (1 + r))  # down-weight easy samples
-
-    return wiou.clamp(min=-1.0, max=3.0)
-
-
-original_bbox_iou = bbox_iou
-
-
-def patched_bbox_iou(box1, box2, xywh=False, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
-    # Calculate standard IoU (with CIoU if requested)
-    iou = original_bbox_iou(box1, box2, xywh, GIoU, DIoU, CIoU, eps)
-
-    # Validation / eval mode: return standard IoU for fair mAP calculation
-    in_validation = getattr(torch, '_v2_validation_in_progress', False)
-    if in_validation or not torch.is_grad_enabled():
-        return iou
-
-    # ----- Path 1: NWD for label assignment (TAL) -----
-    # TAL calls bbox_iou with CIoU=False, xywh=False → NWD blend
-    if patched_bbox_iou._use_nwd and not xywh and not CIoU:
-        nwd = bbox_nwd(box1, box2, eps)
-        nwd = nwd.view(iou.shape)
-        nwd = torch.nan_to_num(nwd, nan=0.0, posinf=0.0, neginf=0.0)
-        return 0.5 * iou.clamp(0) + 0.5 * nwd
-
-    # ----- Path 2: WIoU for bbox regression loss -----
-    # bbox_loss calls bbox_iou with CIoU=True → use WIoU when enabled
-    if CIoU and patched_bbox_iou._use_wiou:
-        wiou = bbox_wiou(box1, box2, xywh, eps)
-        return wiou
-
-    return iou
-
-# Default: disabled until explicitly enabled by TrainingConfig
-patched_bbox_iou._use_nwd = False
-patched_bbox_iou._use_wiou = False
-
-# Apply monkey patches
-import ultralytics.utils.metrics as umetrics
-umetrics.bbox_iou = patched_bbox_iou
-import ultralytics.utils.loss as uloss
-if hasattr(uloss, 'bbox_iou'): uloss.bbox_iou = patched_bbox_iou
-import ultralytics.utils.tal as utal
-if hasattr(utal, 'bbox_iou'): utal.bbox_iou = patched_bbox_iou
 
 
 @dataclass
@@ -233,14 +122,11 @@ class TrainingConfig:
 class DataLoaderCompatibleTrainer(DetectionTrainer):
     """扩展的YOLO训练器，支持直接传入DataLoader + 自定义梯度裁剪 + 改架构时禁止ckpt恢复"""
 
-    # Slot for pre-loaded DetectionModel from CustomTrainer (one-shot handoff)
-    _pretrained_detection_model = None
-
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
         custom_overrides = dict(overrides or {})
         self.custom_train_loader = YOLOLoaderAdapter(custom_overrides.pop("train_loader"))
         self.custom_val_loader = YOLOLoaderAdapter(custom_overrides.pop("val_loader"))
-        # 提取自定义 clip_grad 参数（默认 1.0）
+        self._injected_model = custom_overrides.pop("pretrained_model", None)
         self.clip_grad = float(custom_overrides.pop("clip_grad", 1.0))
         if cfg is None:
             super().__init__(overrides=custom_overrides, _callbacks=_callbacks)
@@ -349,9 +235,9 @@ class DataLoaderCompatibleTrainer(DetectionTrainer):
 
         Flow:
           1. CustomTrainer loads YAML → builds YOLO → loads pretrained → stores DetectionModel
-          2. CustomTrainer sets class-level _pretrained_detection_model
+          2. CustomTrainer passes pretrained_model via overrides dict
           3. Model.train() creates DataLoaderCompatibleTrainer → calls setup_model()
-          4. setup_model() detects the pre-loaded model and injects it
+          4. setup_model() detects the injected model and uses it directly
           5. Returns None so resume_training() doesn't load stale optimizer state
 
         For resume (`.pt` path): fall through to default which handles
@@ -360,11 +246,9 @@ class DataLoaderCompatibleTrainer(DetectionTrainer):
         if isinstance(self.model, torch.nn.Module):
             return  # already loaded (e.g. from resume)
 
-        # Consume pre-loaded model from CustomTrainer (one-shot)
-        pt_model = getattr(self.__class__, "_pretrained_detection_model", None)
-        if pt_model is not None:
-            self.model = pt_model
-            self.__class__._pretrained_detection_model = None  # consume once
+        if self._injected_model is not None:
+            self.model = self._injected_model
+            self._injected_model = None
             return  # ckpt=None → skip resume_training
 
         # Resume from a .pt checkpoint → use default behavior (load weights + ckpt)
@@ -398,11 +282,11 @@ class DataLoaderCompatibleValidator(DetectionValidator):
 
     def __call__(self, trainer=None, model=None):
         # 开启验证阶段 NWD 的锁定标志
-        setattr(torch, '_v2_validation_in_progress', True)
+        set_validation_mode(True)
         try:
             return super().__call__(trainer, model)
         finally:
-            setattr(torch, '_v2_validation_in_progress', False)
+            set_validation_mode(False)
 
 
 class YOLOLoaderAdapter:
@@ -478,47 +362,6 @@ class YOLOLoaderAdapter:
         return getattr(self.loader, item)
 
 
-class SequenceBatchSampler(Sampler[list[int]]):
-    """
-    Shuffles the order of sequences but yields consecutive frames grouped by sequences.
-    This effectively resolves IO issues: continuous frames within the same sequence
-    hit the cache efficiently, and `DataLoader` gets enough items in multithreaded workers.
-    """
-    def __init__(self, dataset: YOLODataset, batch_size: int, drop_last: bool, shuffle: bool = True):
-        super().__init__(None) # PyTorch Sampler initialization
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.shuffle = shuffle
-
-        # Precompute boundaries for each sequence
-        self.sequence_indices: list[list[int]] = []
-        cur_idx = 0
-        for seq in dataset.sequences:
-            n_frames = len(seq)
-            self.sequence_indices.append(list(range(cur_idx, cur_idx + n_frames)))
-            cur_idx += n_frames
-
-    def __iter__(self):
-        seq_order = list(range(len(self.sequence_indices)))
-        if self.shuffle:
-            np.random.shuffle(seq_order)
-
-        batch = []
-        for seq_idx in seq_order:
-            for idx in self.sequence_indices[seq_idx]:
-                batch.append(idx)
-                if len(batch) == self.batch_size:
-                    yield batch
-                    batch = []
-        if len(batch) > 0 and not self.drop_last:
-            yield batch
-
-    def __len__(self) -> int:
-        if self.drop_last:
-            return len(self.dataset) // self.batch_size
-        else:
-            return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 
 class CustomTrainer:
@@ -537,18 +380,17 @@ class CustomTrainer:
 
         # IR-YOLOv8n: load from YAML then load pretrained weights
         if self._is_ir_model():
-            from models.custom_modules import ECA, GSConv, C2f_GS  # noqa: ensure registration
+            from models.custom_modules import register_custom_modules
+            register_custom_modules()
             self.model = YOLO(self.config.base_model)
             if self.config.pretrained and self.config.pretrained_weights:
                 self._load_pretrained_into_ir(self.config.pretrained_weights)
-                # Hand off the built DetectionModel to the trainer via class-level slot
-                DataLoaderCompatibleTrainer._pretrained_detection_model = self.model.model
         else:
             self.model = YOLO(self.model_source)
 
         # Set NWD/WIoU flags on the patched function
-        patched_bbox_iou._use_nwd = self.config.use_nwd
-        patched_bbox_iou._use_wiou = self.config.wiou_loss
+        self.loss_strategy = LossStrategy(use_nwd=self.config.use_nwd, use_wiou=self.config.wiou_loss)
+        self.loss_strategy.activate()
 
         # ===== 预处理对比评估 =====
         # 已迁移至 evaluate.py，训练完成后由 _run_preprocess_comparison 统一调用。
@@ -779,6 +621,7 @@ class CustomTrainer:
             trainer=DataLoaderCompatibleTrainer,
             train_loader=self.train_loader,
             val_loader=self.val_loader,
+            pretrained_model=self.model.model,
         )
 
     def _sanitize_ema_before_save(self, trainer) -> None:

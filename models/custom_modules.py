@@ -1,7 +1,9 @@
 """
 Custom modules for IR-YOLOv8n: ECA, GSConv, C2f_GS
 
-Auto-injects into ultralytics.nn.tasks globals so they can be referenced in YAML.
+Usage:
+    from models.custom_modules import register_custom_modules
+    register_custom_modules()   # call before creating a YOLO model from YAML
 """
 import math
 
@@ -76,61 +78,58 @@ class C2f_GS(nn.Module):
         return self.cv2(torch.cat(y, 1))
 
 
-# ========== Auto-inject custom modules into ultralytics.nn.tasks ==========
-# Strategy: register modules into _tasks globals (so YAML references resolve),
-# then replace parse_model with a version whose frozensets include our modules.
-import ast
-import contextlib
+# ========== Registration API ==========
+
 import inspect
 import re
 
-import ultralytics.nn.tasks as _tasks
-
-_tasks.ECA = ECA
-_tasks.GSConv = GSConv
-_tasks.Bottleneck_GS = Bottleneck_GS
-_tasks.C2f_GS = C2f_GS
-
-# Save original for fallback
-_original_parse_model = _tasks.parse_model
+_registered = False
 
 
-def _build_patched_parse_model():
-    """Build a patched parse_model by injecting our modules into its frozensets.
+def register_custom_modules():
+    """Register ECA, GSConv, C2f_GS with ultralytics for YAML model definitions.
 
-    Instead of duplicating the entire ~150-line function (which breaks on
-    ultralytics updates), we modify the source to add GSConv/C2f_GS to the
-    two hardcoded frozensets, then exec the result.
+    Must be called before YOLO("path/to/yaml") if the YAML references these modules.
+    Safe to call multiple times (idempotent).
     """
+    global _registered
+    if _registered:
+        return
+    _registered = True
+
+    import ultralytics.nn.tasks as tasks
+
+    tasks.ECA = ECA
+    tasks.GSConv = GSConv
+    tasks.Bottleneck_GS = Bottleneck_GS
+    tasks.C2f_GS = C2f_GS
+
+    original_parse_model = tasks.parse_model
+    patched = _build_patched_parse_model(original_parse_model)
+    tasks.parse_model = patched
+
+
+def _build_patched_parse_model(original):
+    """Build a patched parse_model by injecting custom modules into its frozensets."""
     try:
-        src = inspect.getsource(_original_parse_model)
+        src = inspect.getsource(original)
     except OSError:
-        return _original_parse_model  # fallback: can't read source
-
-    # The frozensets span multiple lines:
-    #     base_modules = frozenset(
-    #         {
-    #             ...
-    #         }
-    #     )
-    # Insert our custom modules before the closing brace of each frozenset.
-
-    def _inject_into_frozenset(source: str, varname: str, modules: str) -> str:
-        """Insert `modules` before the closing }} of frozenset named `varname`."""
-        pattern = rf'({varname}\s*=\s*frozenset\s*\(\s*\{{[^}}]*)'
-        match = re.search(pattern, source, re.DOTALL)
-        if not match:
-            return source
-        end = match.end()
-        return source[:end] + " " + modules + "," + source[end:]
+        return original
 
     src = _inject_into_frozenset(src, "base_modules", "GSConv, C2f_GS")
     src = _inject_into_frozenset(src, "repeat_modules", "C2f_GS")
 
-    # Build a namespace with the same imports the original parse_model expects
+    import ultralytics.nn.tasks as tasks
     namespace: dict = {}
-    exec(src, _tasks.__dict__, namespace)
-    return namespace.get("parse_model", _original_parse_model)
+    exec(src, tasks.__dict__, namespace)
+    return namespace.get("parse_model", original)
 
 
-_tasks.parse_model = _build_patched_parse_model()
+def _inject_into_frozenset(source: str, varname: str, modules: str) -> str:
+    """Insert `modules` before the closing }} of frozenset named `varname`."""
+    pattern = rf'({varname}\s*=\s*frozenset\s*\(\s*\{{[^}}]*)'
+    match = re.search(pattern, source, re.DOTALL)
+    if not match:
+        return source
+    end = match.end()
+    return source[:end] + " " + modules + "," + source[end:]
